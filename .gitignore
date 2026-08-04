@@ -1,0 +1,59 @@
+# ---- 构建产物 ----
+build/
+build_qt/
+bin/
+CMakeFiles/
+*.o
+*.so
+*.a
+*.d
+
+# ---- 大文件 / 数据 / 模型 ----
+Vocabulary/
+engine/
+*.zip
+*.bag
+*.ply
+*.pcd
+Examples/Monocular-Inertial/TUM_IMU/
+Examples/Monocular-Inertial/EuRoC_IMU/
+Examples/Stereo-Inertial/TUM_IMU/
+Examples/Stereo-Inertial/EuRoC_IMU/
+Examples/FWS-SLAM-ROS/build/
+Examples/FWS-SLAM-ROS/bin/
+Thirdparty/Sophus/build/
+Thirdparty/Sophus/build1/
+
+# ---- 运行输出 / 日志 ----
+mine/
+evo/
+run/
+*.tum
+CameraTrajectory.txt
+KeyFrameTrajectory.txt
+FrameStats.txt
+image_quality.txt
+Detection3D.txt
+plane_scale_debug.txt
+1.txt
+20260801——0930/
+
+# ---- 误提交的预编译二进制 ----
+Examples/Monocular-Inertial/mono_inertial_euroc
+Examples/Monocular-Inertial/mono_inertial_tum_vi
+Examples/Monocular/mono_tum_vi
+Examples/RGB-D/rgbd_tum
+Examples/Stereo-Inertial/stereo_inertial_euroc
+Examples/Stereo-Inertial/stereo_inertial_tum_vi
+Examples/Stereo/stereo_euroc
+Examples/Stereo/stereo_kitti
+Examples/Stereo/stereo_tum_vi
+src/extractor_orb/enhance_contrast
+src/extractor_orb/fw_enhance
+
+# ---- IDE / 环境 ----
+.idea/
+.vscode/
+.cache/
+.agents/
+.codex/
