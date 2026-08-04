@@ -43,6 +43,7 @@
 #include "ImageQuality.h"
 
 #include <mutex>
+#include <atomic>
 #include <unordered_set>
 
 // #include "pointcloudmapping.h"
@@ -164,6 +165,12 @@ public:
     // Input sensor
     int mSensor;
 
+    // 尺度回拉请求/执行接口（LocalMapping安全点会调用Consume/Apply）
+    void RequestScalePullback(float lambda);            // PlaneRemark调用（非阻塞）
+    bool ConsumeScalePullback(float& lambda);           // LocalMapping安全点调用（取走请求）
+    void ApplyScalePullback(float lambda);              // 在LocalMapping线程执行地图缩放
+    void SyncCurrentFrameScale();                       // Track()开头同步当前/上一帧位姿缩放
+
     // Current Frame
     Frame mCurrentFrame;
     Frame mLastFrame;
@@ -249,7 +256,6 @@ protected:
     void CollectGroundPlaneData();       // 收集语义地面点数据(初始化后100帧)
     void FitGroundPlane();               // 拟合地面平面0(100帧后执行)
     void PlaneRemark();                  // 每30帧刷新平面标记 + 动态偏移量 + λ + BA约束强度
-    void GlobalScalePullback(float lambda);  // 全局尺度回拉：λ退化时对当前地图整体×1/λ（仅纯单目）
     void ProjectPlanePoints();           // 将平面归属点硬投影到平面上（锚定尺度）
     void Lift2DBoxesTo3D();              // 2D检测框 → 3D框 (Cube-SLAM风格)
 
@@ -474,8 +480,17 @@ protected:
 
     // 全局尺度回拉（绕圆/旋转主导场景下单目尺度快速退化的整体补偿）
     long unsigned int mnLastScalePullbackFrameId = 0;  // 上次回拉时的帧ID（间隔门控，防振荡）
+    long unsigned int mnLastPullbackAttemptFrameId = 0; // 上次尝试回拉的帧ID（防止失败后每30帧空转重试）
     unsigned int mnScalePullbackCount = 0;             // 回拉次数统计
     std::vector<float> mvPlaneLambdaHist;              // λ历史（PlaneRemark每次记录，调试用）
+
+    // 尺度回拉改为"Tracking请求→LocalMapping安全点执行"：
+    // Tracking线程不暂停LocalMapping、不抢地图锁（避免与LocalMapping/LoopClosing的
+    // 停止-独占协议互踩导致回拉永远无法执行或挂死）。
+    std::mutex mMutexScalePullback;                     // 保护以下请求字段
+    bool mbScalePullbackPending = false;                // 有待执行的回拉请求
+    float mfScalePullbackLambda = 1.0f;                 // 请求的λ
+    std::atomic<float> mfPendingFrameScale;             // 回拉已应用后待Tracking同步的帧位姿缩放
 
     std::vector<Detection3D> mvDetection3Ds;        // 3D检测框：每帧Lift2DBoxesTo3D的结果
     long unsigned int mnLastLift3DFrameId = 0;      // 上次执行Lift2DBoxesTo3D的帧ID（频率控制）

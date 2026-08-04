@@ -56,7 +56,8 @@ Tracking::Tracking(System *pSys, ORBVocabulary* pVoc, FrameDrawer *pFrameDrawer,
     mnInitialFrameId(0), mbCreatedMap(false), mnFirstFrameId(0), mpCamera2(nullptr), mpLastKeyFrame(static_cast<KeyFrame*>(NULL)),
     mbVibrationThresholdsInitialized(false), mOptimizedRotationThreshold(0.018), mOptimizedVerticalThreshold(0.5),
     mMonoInitFrameId(0), mbPlaneFitted(false), mnLastPlaneCollectKFId(0),
-        mfVehicleRefHeight(0.0f), mbVehicleHeightFrozen(false)
+        mfVehicleRefHeight(0.0f), mbVehicleHeightFrozen(false),
+        mfPendingFrameScale(1.0f)
 {
     // Load camera parameters from settings file
     if(settings){
@@ -2198,6 +2199,9 @@ void Tracking::SaveFrameStatisticsToFile()
 void Tracking::Track()
 {
     mFrameStartTime = std::chrono::steady_clock::now();
+
+    // 若LocalMapping已执行尺度回拉，同步当前/上一帧位姿（保证与地图尺度一致）
+    SyncCurrentFrameScale();
 
     // 步进模式处理：如果启用步进模式，等待用户触发下一步
     if (bStepByStep)
@@ -6445,17 +6449,20 @@ void Tracking::PlaneRemark()
             if(mvPlaneLambdaHist.size() > 50) mvPlaneLambdaHist.erase(mvPlaneLambdaHist.begin());
 
             // 步骤4.5: 全局尺度回拉——绕圆/旋转主导场景下单目尺度快速退化时，
-            // 对当前地图整体×1/λ拉回冻结平面参考尺度（100帧最小间隔作为迟滞防振荡）
+            // 对当前地图整体×1/λ拉回冻结平面参考尺度。
+            // 两个间隔门控：成功回拉间隔>100帧（迟滞防振荡）；
+            // 尝试间隔>90帧（失败/被跳过时不要每30帧空转重试，避免反复3秒停建图）
             if(mSensor == System::MONOCULAR && lambda < 0.85f
-               && mCurrentFrame.mnId - mnLastScalePullbackFrameId > 100)
+               && mCurrentFrame.mnId - mnLastScalePullbackFrameId > 100
+               && mCurrentFrame.mnId - mnLastPullbackAttemptFrameId > 90)
             {
-                cout << "[PlaneRemark] ★触发全局尺度回拉: λ=" << lambda
+                mnLastPullbackAttemptFrameId = mCurrentFrame.mnId;
+                cout << "[PlaneRemark] ★登记尺度回拉请求: λ=" << lambda
                      << " d_ref=" << d_ref << " H_cam=" << camHeight
                      << " 距上次回拉=" << (mCurrentFrame.mnId - mnLastScalePullbackFrameId)
                      << " 帧" << endl;
-                GlobalScalePullback(lambda);
-                lambda = 1.0f;   // 回拉后按尺度健康处理，步骤5的boost自然回到1.0
-                pMap->SetPlaneScaleLambda(lambda);
+                // 非阻塞登记：由LocalMapping在安全点执行（ApplyScalePullback内部重置λ）
+                RequestScalePullback(lambda);
             }
         }
         pMap->ClearTriangRatios();
@@ -6496,7 +6503,7 @@ void Tracking::PlaneRemark()
         // 写入 plane_scale_debug.txt（CSV，每30帧一行，便于离线分析）
         {
             static bool bHeader = false;
-            std::ofstream fDbg("plane_scale_debug.txt", std::ios::app);
+            std::ofstream fDbg("plane_scale_debug.txt", std::ios::out);  // 每次运行重新生成，便于对比
             if(fDbg.is_open()) {
                 if(!bHeader) {
                     fDbg << "frame_id,time_s,lambda,d_ref,d_dynamic,cam_height,n_plane_pts,n_new,n_removed,n_ratios,boost,n_pullbacks\n";
@@ -6563,18 +6570,34 @@ void Tracking::PlaneRemark()
 }
 
 /**
- * 全局尺度回拉：绕圆/转弯等旋转主导场景下，单目尺度快速收缩（λ<0.85）时，
- * 对当前地图整体做一次相似变换 ×1/λ，把所有旧点一次性拉回冻结平面参考尺度：
- *   - 所有 KeyFrame 平移 ×s（旋转不变）
- *   - 所有 MapPoint 世界坐标 ×s，并刷新尺度相关量（mfMaxDistance/mfMinDistance）
- *   - 当前帧/上一帧位姿同步 ×s（点与位姿同因子绕原点缩放，重投影不变，跟踪无缝）
- *   - 动态偏移 d_dynamic ×s（d_ref 为冻结参考尺度，保持不变）
- * 数学依据：λ = median(t_triang/t_frozen) ≈ 当前全局尺度/冻结参考尺度，
- * 因此 ×1/λ 恰好把整图拉回参考尺度；逐点保留相对深度结构，比推到平面深度更安全。
- * 并发安全：先暂停 LocalMapping（与 LoopClosing::CorrectLoop 同款模式），
- * 并跳过全局BA运行期间（其末段"更新地图"会整体改写点/位姿）。
+ * 尺度回拉请求/执行（Tracking请求 → LocalMapping安全点执行）
+ *
+ * 背景：早期版本在Tracking线程里"暂停LocalMapping→独占改图"，实测与
+ * LocalMapping/LoopClosing的停止协议互踩——LocalMapping忙于处理关键帧队列
+ * 数秒停不下来、地图锁被环回/合并/GBA长期占用，导致回拉几乎从未成功执行。
+ *
+ * 新方案：PlaneRemark只在Tracking线程登记请求（非阻塞，无任何等待）；
+ * LocalMapping在Run循环的安全点（空闲、无并发写图）取出请求并执行缩放。
+ * 该安全点天然满足独占性——LoopClosing/GBA改写地图前都会先暂停LocalMapping，
+ * 因此执行时不会有其他线程同时改图。
  */
-void Tracking::GlobalScalePullback(float lambda)
+void Tracking::RequestScalePullback(float lambda)
+{
+    unique_lock<mutex> lock(mMutexScalePullback);
+    mbScalePullbackPending = true;
+    mfScalePullbackLambda = lambda;
+}
+
+bool Tracking::ConsumeScalePullback(float& lambda)
+{
+    unique_lock<mutex> lock(mMutexScalePullback);
+    if(!mbScalePullbackPending) return false;
+    mbScalePullbackPending = false;
+    lambda = mfScalePullbackLambda;
+    return true;
+}
+
+void Tracking::ApplyScalePullback(float lambda)
 {
     Map* pMap = mpAtlas->GetCurrentMap();
     if(!pMap || !pMap->IsPlaneEstimated()) return;
@@ -6582,15 +6605,9 @@ void Tracking::GlobalScalePullback(float lambda)
     const float s = 1.0f / std::max(lambda, 0.3f);   // λ封底0.3，单次放大不超过3.33倍
     if(s < 1.001f) return;
 
-    const float dRefBefore = pMap->GetPlaneRefOffset();   // 冻结参考（不缩放）
-    const float hCamBefore = pMap->GetPlaneRefHeight();   // 冻结参考相机高度（不缩放）
-
-    if(mpLoopClosing && mpLoopClosing->isRunningGBA()) return;  // 全局BA期间不动地图
-
-    // 暂停LocalMapping，避免与BA/三角化并发修改地图
-    mpLocalMapper->RequestStop();
-    while(!mpLocalMapper->isStopped() && !mpLocalMapper->isFinished())
-        usleep(1000);
+    // 与LoopClosing/GBA的地图更新串行化。在LocalMapping线程的安全点调用，
+    // 持锁时间短（纯算术缩放），不会长期阻塞其他线程
+    unique_lock<mutex> mapLock(pMap->mMutexMapUpdate);
 
     // 1. 缩放所有关键帧平移（旋转不变）——先于点，供UpdateNormalAndDepth读取新位姿
     vector<KeyFrame*> vKFs = pMap->GetAllKeyFrames();
@@ -6610,35 +6627,44 @@ void Tracking::GlobalScalePullback(float lambda)
         pMP->UpdateNormalAndDepth();
     }
 
-    // 3. 当前帧/上一帧位姿同步缩放（重投影不变，跟踪无缝；后续PnP/TrackLocalMap会在此基础上精化）
-    Sophus::SE3f TcwCur = mCurrentFrame.GetPose();
-    TcwCur.translation() *= s;
-    mCurrentFrame.SetPose(TcwCur);
-
-    Sophus::SE3f TcwLast = mLastFrame.GetPose();
-    TcwLast.translation() *= s;
-    mLastFrame.SetPose(TcwLast);
-
-    // 4. 动态偏移量随尺度缩放（d_ref冻结不变）
+    // 3. 动态偏移量随尺度缩放（d_ref冻结不变）
     pMap->SetPlaneDynamicOffset(pMap->GetPlaneDynamicOffset() * s);
 
-    // 5. 清空退化期收集的车辆高度样本（已被尺度污染，须在健康期重新统计）
+    // 4. 清空退化期收集的车辆高度样本（已被尺度污染，须在健康期重新统计）
     mvVehicleHeightSamples.clear();
 
-    // 6. λ重置为健康值（调用方随后将局部lambda置1，boost自然回到1.0）
+    // 5. λ重置为健康值
     pMap->SetPlaneScaleLambda(1.0f);
 
-    mnLastScalePullbackFrameId = mCurrentFrame.mnId;
     mnScalePullbackCount++;
-    cout << "[GlobalScalePullback] #" << mnScalePullbackCount
+
+    // 6. 通知Tracking在Track()开头同步当前/上一帧位姿（保证与地图尺度一致）
+    mfPendingFrameScale.store(s);
+
+    cout << "[ScalePullback] #" << mnScalePullbackCount
          << " lambda=" << lambda << " s=" << s
          << " points=" << vMPs.size() << " kfs=" << vKFs.size()
-         << " d_ref(冻结)=" << dRefBefore
-         << " H_cam(冻结)=" << hCamBefore
-         << " d_dyn->" << pMap->GetPlaneDynamicOffset()
-         << " 当前帧id=" << mCurrentFrame.mnId << endl;
+         << " d_ref(冻结)=" << pMap->GetPlaneRefOffset()
+         << " H_cam(冻结)=" << pMap->GetPlaneRefHeight()
+         << " d_dyn->" << pMap->GetPlaneDynamicOffset() << endl;
+}
 
-    mpLocalMapper->Release();
+void Tracking::SyncCurrentFrameScale()
+{
+    const float s = mfPendingFrameScale.exchange(1.0f);
+    if(s < 0.999f || s > 1.001f)
+    {
+        // 点与位姿同因子绕原点缩放，重投影不变，跟踪无缝
+        Sophus::SE3f TcwCur = mCurrentFrame.GetPose();
+        TcwCur.translation() *= s;
+        mCurrentFrame.SetPose(TcwCur);
+
+        Sophus::SE3f TcwLast = mLastFrame.GetPose();
+        TcwLast.translation() *= s;
+        mLastFrame.SetPose(TcwLast);
+
+        mnLastScalePullbackFrameId = mCurrentFrame.mnId;
+    }
 }
 
 // 标记动态语义特征点为异常点

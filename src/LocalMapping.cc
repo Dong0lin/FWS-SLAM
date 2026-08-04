@@ -31,7 +31,7 @@ namespace ORB_SLAM3
 {
 
 LocalMapping::LocalMapping(System* pSys, Atlas *pAtlas, const float bMonocular, bool bInertial, const string &_strSeqName):
-    mpSystem(pSys), mbMonocular(bMonocular), mbInertial(bInertial), mbResetRequested(false), mbResetRequestedActiveMap(false), mbFinishRequested(false), mbFinished(true), mpAtlas(pAtlas), bInitializing(false),
+    mpSystem(pSys), mpTracker(static_cast<Tracking*>(NULL)), mbMonocular(bMonocular), mbInertial(bInertial), mbResetRequested(false), mbResetRequestedActiveMap(false), mbFinishRequested(false), mbFinished(true), mpAtlas(pAtlas), bInitializing(false),
     mbAbortBA(false), mbStopped(false), mbStopRequested(false), mbNotStop(false), mbAcceptKeyFrames(true),
     mIdxInit(0), mScale(1.0), mInitSect(0), mbNotBA1(true), mbNotBA2(true), mIdxIteration(0), infoInertial(Eigen::MatrixXd::Zero(9,9))
 {
@@ -269,6 +269,17 @@ void LocalMapping::Run()
 
         ResetIfRequested();
 
+        // 执行Tracking登记的尺度回拉（安全点：本地建图空闲、无并发写图；
+        // LoopClosing/GBA改写地图前都会先暂停本线程，因此此处执行不会与其并发）
+        {
+            float lambdaPull;
+            if(mpTracker && mpTracker->ConsumeScalePullback(lambdaPull))
+            {
+                cout << "[LocalMapping] 执行尺度回拉 λ=" << lambdaPull << endl;
+                mpTracker->ApplyScalePullback(lambdaPull);
+            }
+        }
+
         // Tracking will see that Local Mapping is busy
         SetAcceptKeyFrames(true);
 
@@ -433,7 +444,10 @@ void LocalMapping::CreateNewMapPoints()
     // Search matches with epipolar restriction and triangulate
     for(size_t i=0; i<vpNeighKFs.size(); i++)
     {
-        if(i>0 && CheckNewKeyFrames())
+        // 可中断：收到停止请求时立即退出（CreateNewMapPoints是长任务，
+        // 不检查Stop会让回拉/环回的停止等待超时）。注意 i=0 也必须检查，
+        // 否则第一个邻居对的三角化（debug下可达数秒）会让停止等待超时。
+        if((i>0 && CheckNewKeyFrames()) || stopRequested())
             return;
 
         KeyFrame* pKF2 = vpNeighKFs[i];
@@ -487,6 +501,10 @@ void LocalMapping::CreateNewMapPoints()
         float fMinScaleRatio = 1.0f, fMaxScaleRatio = 0.0f;
         for(int ikp=0; ikp<nmatches; ikp++)
         {
+            // 注意：不能用mbAbortBA——InsertKeyFrame每次插帧都会置true，
+            // 会导致所有新关键帧的三角化立即退出（点数为0→跟踪饿死）。
+            // 只有显式的停止请求(stopRequested)才中断。
+            if(stopRequested()) break;
             const int &idx1 = vMatchedIndices[ikp].first;
             const int &idx2 = vMatchedIndices[ikp].second;
 
@@ -927,7 +945,10 @@ void LocalMapping::RequestStop()
 {
     unique_lock<mutex> lock(mMutexStop);
     mbStopRequested = true;
-    unique_lock<mutex> lock2(mMutexNewKFs);
+    // 必须同时关闭接收关键帧（上游行为）：否则Tracking在停止窗口内继续插入关键帧，
+    // LocalMapping一直忙，永远走不到停止分支，导致请求方无限/超时等待
+    unique_lock<mutex> lock2(mMutexAccept);
+    mbAcceptKeyFrames = false;
     mbAbortBA = true;
 }
 

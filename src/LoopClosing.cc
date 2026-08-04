@@ -32,11 +32,26 @@
 namespace ORB_SLAM3
 {
 
+// 地图写操作的忙标志守卫：进入 CorrectLoop/MergeLocal/MergeLocal2 期间置 true，
+// 函数任何出口（含异常/提前return）自动复位。Tracking 侧全局尺度回拉据此判断
+// 是否有环回/合并正在改写地图，避免两线程并发暂停 LocalMapping 并并发改图。
+namespace {
+class LoopMapBusyGuard
+{
+public:
+    explicit LoopMapBusyGuard(std::atomic<bool>& flag) : m_flag(flag) { m_flag.store(true); }
+    ~LoopMapBusyGuard() { m_flag.store(false); }
+private:
+    std::atomic<bool>& m_flag;
+};
+}
+
 LoopClosing::LoopClosing(Atlas *pAtlas, KeyFrameDatabase *pDB, ORBVocabulary *pVoc, const bool bFixScale, const bool bActiveLC):
     mbResetRequested(false), mbResetActiveMapRequested(false), mbFinishRequested(false), mbFinished(true), mpAtlas(pAtlas),
     mpKeyFrameDB(pDB), mpORBVocabulary(pVoc), mpMatchedKF(NULL), mLastLoopKFid(0), mbRunningGBA(false), mbFinishedGBA(true),
     mbStopGBA(false), mpThreadGBA(NULL), mbFixScale(bFixScale), mnFullBAIdx(0), mnLoopNumCoincidences(0), mnMergeNumCoincidences(0),
-    mbLoopDetected(false), mbMergeDetected(false), mnLoopNumNotFound(0), mnMergeNumNotFound(0), mbActiveLC(bActiveLC)
+    mbLoopDetected(false), mbMergeDetected(false), mnLoopNumNotFound(0), mnMergeNumNotFound(0), mbActiveLC(bActiveLC),
+    mbMapBusy(false)
 {
     mnCovisibilityConsistencyTh = 3;
     mpLastCurrentKF = static_cast<KeyFrame*>(NULL);
@@ -975,6 +990,7 @@ int LoopClosing::FindMatchesByProjection(KeyFrame* pCurrentKF, KeyFrame* pMatche
 void LoopClosing::CorrectLoop()
 {
     //cout << "Loop detected!" << endl;
+    LoopMapBusyGuard mapBusyGuard(mbMapBusy);
 
     // Send a stop signal to Local Mapping
     // Avoid new keyframes are inserted while correcting the loop
@@ -1220,6 +1236,8 @@ void LoopClosing::CorrectLoop()
 
 void LoopClosing::MergeLocal()
 {
+    LoopMapBusyGuard mapBusyGuard(mbMapBusy);
+
     int numTemporalKFs = 25; //Temporal KFs in the local window if the map is inertial.
 
     //Relationship to rebuild the essential graph, it is used two times, first in the local window and later in the rest of the map
@@ -1789,6 +1807,7 @@ void LoopClosing::MergeLocal()
 void LoopClosing::MergeLocal2()
 {
     //cout << "Merge detected!!!!" << endl;
+    LoopMapBusyGuard mapBusyGuard(mbMapBusy);
 
     int numTemporalKFs = 11; //TODO (set by parameter): Temporal KFs in the local window if the map is inertial.
 
@@ -2273,6 +2292,10 @@ void LoopClosing::ResetIfRequested()
 
 void LoopClosing::RunGlobalBundleAdjustment(Map* pActiveMap, unsigned long nLoopKF)
 {  
+    // GBA 全程（优化+更新地图阶段）置忙：更新阶段会长时间持有 mMutexMapUpdate
+    // 并逐个改写KF/点，Tracking侧全局尺度回拉必须避开
+    LoopMapBusyGuard mapBusyGuard(mbMapBusy);
+
     Verbose::PrintMess("Starting Global Bundle Adjustment", Verbose::VERBOSITY_NORMAL);
 
 #ifdef REGISTER_TIMES

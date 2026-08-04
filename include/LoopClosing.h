@@ -29,6 +29,7 @@
 #include "KeyFrameDatabase.h"
 
 #include <boost/algorithm/string.hpp>
+#include <atomic>
 #include <thread>
 #include <mutex>
 #include "Thirdparty/g2o/g2o/types/types_seven_dof_expmap.h"
@@ -77,6 +78,12 @@ public:
         unique_lock<std::mutex> lock(mMutexGBA);
         return mbFinishedGBA;
     }   
+
+    // 环回修正/地图合并等"改写地图"操作进行中（供 Tracking 侧全局尺度回拉判断是否安全）
+    // 避免两个线程同时暂停 LocalMapping 并并发改写地图导致挂死/崩溃
+    bool IsMapBusy(){
+        return mbMapBusy.load();
+    }
 
     void RequestFinish();
 
@@ -218,6 +225,9 @@ protected:
     bool mbStopGBA;
     std::mutex mMutexGBA;
     std::thread* mpThreadGBA;
+
+    // 环回/合并写地图期间的忙标志（RAII管理，见 LoopClosing.cc 的 LoopMapBusyGuard）
+    std::atomic<bool> mbMapBusy;
 
     // Fix scale in the stereo/RGB-D case
     bool mbFixScale;
