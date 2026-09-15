@@ -17,8 +17,6 @@
 */
 #include "Tracking.h"
 
-#include <unistd.h>   // usleep：全局尺度回拉时等待LocalMapping停止
-
 #include "Settings.h"
 #include "ORBmatcher.h"
 #include "FrameDrawer.h"
@@ -35,10 +33,12 @@
 #include <iostream>
 #include <limits>
 #include <unordered_map>
+#include <cstdio>
 
 #include <mutex>
 #include <chrono>
 #include <cstdlib>
+#include <random>
 
 using namespace std;
 
@@ -55,9 +55,10 @@ Tracking::Tracking(System *pSys, ORBVocabulary* pVoc, FrameDrawer *pFrameDrawer,
     mpFrameDrawer(pFrameDrawer), mpMapDrawer(pMapDrawer), mpAtlas(pAtlas), mnLastRelocFrameId(0), time_recently_lost(5.0),
     mnInitialFrameId(0), mbCreatedMap(false), mnFirstFrameId(0), mpCamera2(nullptr), mpLastKeyFrame(static_cast<KeyFrame*>(NULL)),
     mbVibrationThresholdsInitialized(false), mOptimizedRotationThreshold(0.018), mOptimizedVerticalThreshold(0.5),
-    mMonoInitFrameId(0), mbPlaneFitted(false), mnLastPlaneCollectKFId(0),
+    mMonoInitFrameId(~0UL), mbPlaneFitted(false), mnLastPlaneCollectKFId(0),   // ~0UL 表示"未初始化"哨兵（帧ID可能为0）
+        mnPlaneLowLambdaStreak(0),
         mfVehicleRefHeight(0.0f), mbVehicleHeightFrozen(false),
-        mfPendingFrameScale(1.0f)
+        mbNewDetImgFlag(false), mbNewDetImgFlagRight(false)
 {
     // Load camera parameters from settings file
     if(settings){
@@ -142,13 +143,10 @@ Tracking::Tracking(System *pSys, ORBVocabulary* pVoc, FrameDrawer *pFrameDrawer,
     vdTrackTotal_ms.clear();
 #endif
 
-    // 初始化图像质量日志
-    mbSaveQuality = true;
+    // 初始化图像质量日志：默认关闭（避免每帧/每10帧的指标计算开销），
+    // 由可执行文件参数 --save-quality 显式开启
+    mbSaveQuality = false;
     mPendingQualityValid = false;
-    mQualityLog.open("image_quality.txt", std::ios::out);
-    if (mQualityLog.is_open()) {
-        mQualityLog << FormatMetricsHeader() << std::endl;
-    }
 
     // 初始化帧处理时间统计
     mTrackingStartTime = std::chrono::steady_clock::now();
@@ -599,6 +597,24 @@ void Tracking::newParameterLoader(Settings *settings) {
     if(mSensor==System::STEREO || mSensor==System::RGBD || mSensor==System::IMU_STEREO || mSensor==System::IMU_RGBD ){
         mbf = settings->bf();
         mThDepth = settings->b() * settings->thDepth();
+    }
+
+    // 长短焦（Multi-focal）双目：装载校正参数；
+    // 深度阈值直接用 yaml 的 ThDepth（米，与 MF-SLAM 语义一致）
+    if(settings->isMultiFocal()){
+        Frame::SetMultiFocalCalib(settings->leftK(), settings->leftD(), settings->leftR(), settings->leftP(),
+                                  settings->rightK(), settings->rightD(), settings->rightR(), settings->rightP(),
+                                  settings->focalScale(), settings->roiLeftUp(), settings->roiRightBottom(),
+                                  settings->newImSize().width, settings->newImSize().height,
+                                  settings->minDepth(), settings->maxDepth());
+        mThDepth = settings->thDepth();
+        mfMinDepth = settings->minDepth();
+        mfMaxDepth = settings->maxDepth();
+        if(mpFrameDrawer)
+            mpFrameDrawer->both = true;
+    }
+    else{
+        Frame::ResetMultiFocalCalib();
     }
 
     if(mSensor==System::RGBD || mSensor==System::IMU_RGBD){
@@ -1460,14 +1476,20 @@ void Tracking::SetDetector(Detector *pDetector)
     mpDetector=pDetector;
 }
 
+void Tracking::SetSaveQuality(bool flag)
+{
+    if(flag && !mQualityLog.is_open())
+    {
+        mQualityLog.open("image_quality.txt", std::ios::out);
+        if(mQualityLog.is_open())
+            mQualityLog << FormatMetricsHeader() << std::endl;
+    }
+    mbSaveQuality = flag && mQualityLog.is_open();
+}
+
 void Tracking::SetStepByStep(bool bSet)
 {
     bStepByStep = bSet;
-}
-
-bool Tracking::GetStepByStep()
-{
-    return bStepByStep;
 }
 
 Sophus::SE3f Tracking::GrabImageStereo(const cv::Mat &imRectLeft, const cv::Mat &imRectRight, const double &timestamp, string filename)
@@ -1475,47 +1497,35 @@ Sophus::SE3f Tracking::GrabImageStereo(const cv::Mat &imRectLeft, const cv::Mat 
     // cout << "GrabImageStereo" << endl;
 
         //------------------------------------------------------------------------------------------------
-
-	mpORBextractorLeft = new ORBextractor(nFeatures,fScaleFactor,nLevels,fIniThFAST,fMinThFAST); 
-	mpORBextractorRight = new ORBextractor(nFeatures,fScaleFactor,nLevels,fIniThFAST,fMinThFAST);
-
+    // 注意：ORB 提取器在 Tracking 构造时创建一次并复用（与 GrabImageMonocular 一致），
+    // 不再每帧 new/delete——每帧重建会重复分配金字塔/pattern 结构（帧构造 ~25ms 的隐性开销），
+    // 且 mLastFrame 等持指针的对象在帧尾 delete 后会留下悬垂指针隐患。
     //------------------------------------------------------------------------------------------------
     
     mImGray = imRectLeft;
     cv::Mat imGrayRight = imRectRight;
     mImRight = imRectRight;
 
-    if(mImGray.channels()==3)
-    {
-        //cout << "Image with 3 channels" << endl;
-        if(mbRGB)
-        {
-            cvtColor(mImGray,mImGray,cv::COLOR_RGB2GRAY);
-            cvtColor(imGrayRight,imGrayRight,cv::COLOR_RGB2GRAY);
+    // 左右目分别转灰度（不依赖左目通道数）：
+    // 硬件长短焦相机可能是左目黑白/右目彩色（或反之），
+    // 若只按左目通道判断，另一目会保持 3 通道直接进入 ORB（断言/异常）
+    auto toGray = [this](cv::Mat& im) {
+        if(im.channels() == 3) {
+            if(mbRGB)      cvtColor(im, im, cv::COLOR_RGB2GRAY);
+            else           cvtColor(im, im, cv::COLOR_BGR2GRAY);
+        } else if(im.channels() == 4) {
+            if(mbRGB)      cvtColor(im, im, cv::COLOR_RGBA2GRAY);
+            else           cvtColor(im, im, cv::COLOR_BGRA2GRAY);
         }
-        else
-        {
-            cvtColor(mImGray,mImGray,cv::COLOR_BGR2GRAY);
-            cvtColor(imGrayRight,imGrayRight,cv::COLOR_BGR2GRAY);
-        }
-    }
-    else if(mImGray.channels()==4)
-    {
-        //cout << "Image with 4 channels" << endl;
-        if(mbRGB)
-        {
-            cvtColor(mImGray,mImGray,cv::COLOR_RGBA2GRAY);
-            cvtColor(imGrayRight,imGrayRight,cv::COLOR_RGBA2GRAY);
-        }
-        else
-        {
-            cvtColor(mImGray,mImGray,cv::COLOR_BGRA2GRAY);
-            cvtColor(imGrayRight,imGrayRight,cv::COLOR_BGRA2GRAY);
-        }
-    }
+        // 1 通道（已是灰度）不做转换
+    };
+    toGray(mImGray);
+    toGray(imGrayRight);
 
     // cout << "Incoming frame creation" << endl;
 
+    std::chrono::steady_clock::time_point tOrbStart;
+    if (gEnableTimingStats) tOrbStart = std::chrono::steady_clock::now();
     if (mSensor == System::STEREO && !mpCamera2)
         mCurrentFrame = Frame(mImGray,imGrayRight,timestamp,mpORBextractorLeft,mpORBextractorRight,mpORBVocabulary,mK,mDistCoef,mbf,mThDepth,mpCamera);
        // cout << "GrabImageStereo1" << endl;}
@@ -1525,35 +1535,49 @@ Sophus::SE3f Tracking::GrabImageStereo(const cv::Mat &imRectLeft, const cv::Mat 
         mCurrentFrame = Frame(mImGray,imGrayRight,timestamp,mpORBextractorLeft,mpORBextractorRight,mpORBVocabulary,mK,mDistCoef,mbf,mThDepth,mpCamera,&mLastFrame,*mpImuCalib);
     else if(mSensor == System::IMU_STEREO && mpCamera2)
         mCurrentFrame = Frame(mImGray,imGrayRight,timestamp,mpORBextractorLeft,mpORBextractorRight,mpORBVocabulary,mK,mDistCoef,mbf,mThDepth,mpCamera,mpCamera2,mTlr,&mLastFrame,*mpImuCalib);
+    // 记录 ORB 特征提取耗时（Frame 构造内部完成特征提取；含立体匹配）
+    if (gEnableTimingStats)
+    {
+        auto tOrbEnd = std::chrono::steady_clock::now();
+        mdCurOrbExtractMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(tOrbEnd - tOrbStart).count();
+    }
 
     // 记录图像质量指标（每10帧采样一次，降低CPU开销）
     {
         static int qualityCounter = 0;
-        if (++qualityCounter % 10 == 0)
+        if (++qualityCounter % 30 == 0)
             LogImageQuality(mImGray, mCurrentFrame.mvKeysUn, nLevels, mCurrentFrame.mnId);
     }
     
      // cout << "GrabImageStereo2" << endl;
     //-------------------------------------------------------------------------------
 	std::chrono::steady_clock::time_point t3 = std::chrono::steady_clock::now();
-	// cout << "GrabImageStereo3" << endl;
-	// struct timespec ts, ts1;
-	// ts.tv_nsec = 500000000;    // 1500ms
-        // ts.tv_sec = 1;
-	// cout << !isNewDetectedImgArrived() <<"New"<< endl;
-     while(!isNewDetectedImgArrived()) 
-    {
-        // cout << !isNewDetectedImgArrived() <<"New"<< endl;
-        //cout << "GrabImageStereo4" << endl;
-        usleep(1);
-        // cout << "GrabImageStereo5" << endl;
-    }
-    // cout << "GrabImageStereo4" << endl;
+    // 等待检测完成（条件变量，替代 usleep 忙等待轮询）
+    WaitForDetection();
     std::chrono::steady_clock::time_point t4 = std::chrono::steady_clock::now();
     double ttrack= std::chrono::duration_cast<std::chrono::duration<double> >(t4 - t3).count();
     // cout << "time waiting for detection: " << ttrack*1000 << endl;
 
-	mCurrentFrame.SetBoxes(mpDetector->objects);
+    {
+        // 长短焦模式下，检测框坐标是原始左图坐标，需要校正到与特征点一致的公共坐标系
+        std::vector<Detection> vDetBoxes = mpDetector->objects;
+        if(Frame::mbMultiFocal)
+            Frame::RectifyDetectionBoxes(vDetBoxes);
+        mCurrentFrame.SetBoxes(vDetBoxes);
+        // 左右目检测框匹配（长短焦模式，仅非人目标，类别一致+校正坐标系IoU）：
+        // 结果存入 mvMatchedRightBoxIdx/mvDetectionDepth，供后续建图使用
+        {
+            // 右目检测结果来自独立的右目检测线程（无右目线程时传空）
+            std::vector<Detection> vRightBoxes;
+            if(mpDetectorRight && mpDetectorRight->IsReady())
+            {
+                // 右目异步消费：读最新已完成结果（可能滞后一帧），锁保护避免竞争
+                std::unique_lock<std::mutex> lock(mpDetectorRight->mMutexObjects);
+                vRightBoxes = mpDetectorRight->objects;
+            }
+            mCurrentFrame.MatchRightDetections(vRightBoxes);
+        }
+    }
 
 	//------------------------------------------------------------------------------------
 
@@ -1576,14 +1600,6 @@ Sophus::SE3f Tracking::GrabImageStereo(const cv::Mat &imRectLeft, const cv::Mat 
     // 记录匹配质量指标
     LogMatchingQuality(mCurrentFrame.mnId);
 
-// FEATURE NUMBER UPDATE
-    //------------------------------------------------------------------------------------------------
-
-	//cout << "FACTOR: " << mpDetector->fig_factor << endl;
-
-	delete mpORBextractorLeft;
-	delete mpORBextractorRight;
-		
     //------------------------------------------------------------------------------------------------
     return mCurrentFrame.GetPose();
 }
@@ -1591,11 +1607,8 @@ Sophus::SE3f Tracking::GrabImageStereo(const cv::Mat &imRectLeft, const cv::Mat 
 Sophus::SE3f Tracking::GrabImageRGBD(const cv::Mat &imRGB,const cv::Mat &imD, const double &timestamp, string filename)
 {
     // 保持和Detector相同的输入图片和目标检测框
-    // FEATURE NUMBER UPDATE
-    //------------------------------------------------------------------------------------------------
-	
-	mpORBextractorLeft = new ORBextractor(nFeatures,fScaleFactor,nLevels,fIniThFAST,fMinThFAST); 
-
+    // 注意：ORB 提取器在 Tracking 构造时创建一次并复用（与 GrabImageMonocular 一致），
+    // 不再每帧 new/delete（见 GrabImageStereo 说明）。
     //------------------------------------------------------------------------------------------------
 
     // mImGray = imRGB;
@@ -1630,10 +1643,7 @@ Sophus::SE3f Tracking::GrabImageRGBD(const cv::Mat &imRGB,const cv::Mat &imD, co
 
  //-------------------------------------------------------------------------------------------------
     std::chrono::steady_clock::time_point t3 = std::chrono::steady_clock::now();
-    while(!isNewDetectedImgArrived()) 
-    {
-        usleep(1);
-    }
+    WaitForDetection();
     std::chrono::steady_clock::time_point t4 = std::chrono::steady_clock::now();
     double ttrack= std::chrono::duration_cast<std::chrono::duration<double> >(t4 - t3).count();
     //cout << "time waiting for detection: " << ttrack*1000 << endl;
@@ -1652,8 +1662,6 @@ Sophus::SE3f Tracking::GrabImageRGBD(const cv::Mat &imRGB,const cv::Mat &imD, co
     // 记录匹配质量指标
     LogMatchingQuality(mCurrentFrame.mnId);
 
-	delete mpORBextractorLeft;
-		
     //------------------------------------------------------------------------------------------------
 
     return mCurrentFrame.GetPose();
@@ -1735,23 +1743,41 @@ void Tracking::GetImgForDetector(const cv::Mat& img)
     mpDetector->mCvNewImg.notify_one();
 }
 
-bool Tracking::isNewDetectedImgArrived()
+void Tracking::GetImgForDetector(const cv::Mat& imgLeft, const cv::Mat& imgRight)
 {
-    std::unique_lock <std::mutex> lock(mpDetector->mMutexNewImgDetection);
-    if(mbNewDetImgFlag)
     {
-        mbNewDetImgFlag=false;
-        return true;
+        unique_lock<mutex> lock(mpDetector->mMutexGetNewImg);
+        mpDetector->mbNewImgFlag=true;
+        // 浅拷贝：仅增加引用计数，避免每帧深拷贝整张图像的开销
+        // 安全性保证：Tracking 线程会等待检测完成后才继续处理图像
+        mpDetector->mImg = imgLeft;
     }
-    else 
+    // 通知检测线程有新图像到达（零延迟唤醒）
+    mpDetector->mCvNewImg.notify_one();
+
+    // 右目独立检测线程（长短焦模式创建）：右图送入右目检测器，
+    // 与左目并行推理（各自独立的 TensorRT context/stream，可重叠占用 GPU）
+    if(mpDetectorRight)
     {
-	    return false;
+        {
+            unique_lock<mutex> lock(mpDetectorRight->mMutexGetNewImg);
+            mpDetectorRight->mbNewImgFlag = true;
+            mpDetectorRight->mImg = imgRight;
+        }
+        mpDetectorRight->mCvNewImg.notify_one();
     }
 }
 
-// 使用条件变量等待检测完成（替代 usleep 忙等待，零CPU开销）
+// 使用条件变量等待检测完成（替代 usleep 忙等待，零CPU开销）。
+// 只等左目（主语义管线依赖左目检测框）：右目检测线程异步产出、
+// Tracking 直接读最新结果（滞后一帧）——右目框只用于左右目匹配/3D 框深度/可视化，
+// 不阻塞主线程，避免 GPU 上左右目推理串行时右目成为帧率瓶颈。
 void Tracking::WaitForDetection()
 {
+    const bool bLeftReady  = (!mpDetector || !mpDetector->IsReady());        // 无左检测器/不可用→视为完成
+    if(bLeftReady)
+        return;
+
     std::unique_lock<std::mutex> lock(mpDetector->mMutexCvDetDone);
     mpDetector->mCvDetDone.wait(lock, [this]{ return mbNewDetImgFlag; });
     mbNewDetImgFlag = false;
@@ -1829,7 +1855,7 @@ Sophus::SE3f Tracking::GrabImageMonocular(const cv::Mat &im, const double &times
     // 记录图像质量指标（每10帧采样一次，降低CPU开销）
     {
         static int qualityCounter = 0;
-        if (++qualityCounter % 10 == 0)
+        if (++qualityCounter % 30 == 0)
             LogImageQuality(mImGray, mCurrentFrame.mvKeysUn, nLevels, mCurrentFrame.mnId);
     }
     
@@ -2075,6 +2101,11 @@ void Tracking::UpdateFrameStatistics()
         mdStageTrack         += frameTimeMs;
         mdStageOrbExtract    += mdCurOrbExtractMs;
         mdStageWaitDetect    += mdCurWaitDetectMs;
+        mdStageSemantic      += mdCurSemanticMs;
+        mdStageSemVibration  += mdCurSemVibrationMs;
+        mdStageSemDynamic    += mdCurSemDynamicMs;
+        mdStageSemGround     += mdCurSemGroundMs;
+        mdStageSemLift       += mdCurSemLiftMs;
         mdStageTotalPipeline += (mdCurOrbExtractMs + mdCurWaitDetectMs + frameTimeMs);
         if (mdCurWaitDetectMs > mdMaxWaitDetect)
             mdMaxWaitDetect = mdCurWaitDetectMs;
@@ -2148,6 +2179,12 @@ void Tracking::PrintFrameStatistics()
         std::cout << "ORB extract:      " << avgOrb   << " ms  (" << (avgTotal>0? 100.0*avgOrb/avgTotal:0.0)   << "%)" << std::endl;
         std::cout << "Wait detection:   " << avgWait  << " ms  (" << (avgTotal>0? 100.0*avgWait/avgTotal:0.0)  << "%)   max=" << mdMaxWaitDetect << " ms" << std::endl;
         std::cout << "Track() core:     " << avgTrack << " ms  (" << (avgTotal>0? 100.0*avgTrack/avgTotal:0.0) << "%)" << std::endl;
+        double avgSem = mdStageSemantic / mnTotalFrames;
+        std::cout << "  -> 语义管线:    " << avgSem   << " ms  (振动/动态点/地面/3D框)" << std::endl;
+        std::cout << "     振动指标:    " << (mdStageSemVibration / mnTotalFrames) << " ms" << std::endl;
+        std::cout << "     动态点:      " << (mdStageSemDynamic   / mnTotalFrames) << " ms" << std::endl;
+        std::cout << "     地面+平面:   " << (mdStageSemGround    / mnTotalFrames) << " ms" << std::endl;
+        std::cout << "     3D框提升:    " << (mdStageSemLift      / mnTotalFrames) << " ms" << std::endl;
         std::cout << "--------------------------------------" << std::endl;
         std::cout << "Full pipeline:    " << avgTotal << " ms  ->  " << (avgTotal>0? 1000.0/avgTotal:0.0) << " fps (compute limit)" << std::endl;
         std::cout << "======================================" << std::endl;
@@ -2199,9 +2236,6 @@ void Tracking::SaveFrameStatisticsToFile()
 void Tracking::Track()
 {
     mFrameStartTime = std::chrono::steady_clock::now();
-
-    // 若LocalMapping已执行尺度回拉，同步当前/上一帧位姿（保证与地图尺度一致）
-    SyncCurrentFrameScale();
 
     // 步进模式处理：如果启用步进模式，等待用户触发下一步
     if (bStepByStep)
@@ -2441,6 +2475,16 @@ void Tracking::Track()
                     {
                         // 非IMU传感器：尝试重定位
                         bOK = Relocalization(); // 执行重定位
+                        // 扑翼转向段：重定位常失败（前视航拍无回环结构），但局部地图与
+                        // 运动模型仍然有效；退化到运动模型/参考KF恢复位姿，
+                        // 再由 TrackLocalMap 做最终验证，避免长时间卡在 RECENTLY_LOST。
+                        if(!bOK)
+                        {
+                            if(mbVelocity)
+                                bOK = TrackWithMotionModel();
+                            if(!bOK)
+                                bOK = TrackReferenceKeyFrame();
+                        }
                         //std::cout << "mCurrentFrame.mTimeStamp:" << to_string(mCurrentFrame.mTimeStamp) << std::endl;
                         //std::cout << "mTimeStampLost:" << to_string(mTimeStampLost) << std::endl;
                         // 振动自适应：振动大时延长恢复窗口（基础3秒，振动大时最长6秒）
@@ -2690,9 +2734,13 @@ void Tracking::Track()
         }
         else
         {
-            if (mpViewer && !mpViewer->isStopped())
+            // 检测框绘制：Viewer 与 Qt/ROS 模式都绘制（Qt 模式显示到界面图像）
+            if (this->mpDetector != nullptr && !this->mpDetector->mImg.empty())
             {
                 mpDetector->draw(mpDetector->mImg, mpDetector->objects);
+            }
+            if (mpViewer && !mpViewer->isStopped())
+            {
                 DrawDynamicSemanticPoints();
             }
 
@@ -2701,6 +2749,40 @@ void Tracking::Track()
             if (this->mpDetector != nullptr && !this->mpDetector->mImg.empty())
             {
                 this->mImColor = this->mpDetector->mImg;
+            }
+        }
+        // 右目（长焦）检测：由独立右目检测线程执行，始终绘制在右目原始图像上
+        // （左右窗口独立显示，不参与语义/动态管线）
+        if (this->mpDetectorRight != nullptr && this->mpDetectorRight->IsReady() &&
+            !this->mpDetectorRight->mImg.empty())
+        {
+            std::vector<Detection> vRightDraw;
+            {
+                std::unique_lock<std::mutex> lock(mpDetectorRight->mMutexObjects);
+                vRightDraw = mpDetectorRight->objects;
+            }
+            mpDetectorRight->draw(mpDetectorRight->mImg, vRightDraw);
+            this->mImColorRight = this->mpDetectorRight->mImg;
+
+            // 左右目匹配的检测框：在左右窗口画相同编号，便于核对对应关系
+            // （编号=左目检测框索引；右目框为 objectsRight[mvMatchedRightBoxIdx[i]]）
+            if(!mCurrentFrame.mvMatchedRightBoxIdx.empty())
+            {
+                const auto& vL = mpDetector->objects;
+                for(size_t i = 0; i < mCurrentFrame.mvMatchedRightBoxIdx.size(); i++)
+                {
+                    const int j = mCurrentFrame.mvMatchedRightBoxIdx[i];
+                    if(j < 0 || j >= (int)vRightDraw.size() || i >= vL.size())
+                        continue;
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "%zu", i);
+                    cv::putText(mpDetector->mImg, buf,
+                                cv::Point(vL[i].bbox.x + 3, vL[i].bbox.y + 3),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
+                    cv::putText(mpDetectorRight->mImg, buf,
+                                cv::Point(vRightDraw[j].bbox.x + 3, vRightDraw[j].bbox.y + 3),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
+                }
             }
         }
         mpFrameDrawer->Update(this); // 更新帧绘制器
@@ -2847,9 +2929,62 @@ void Tracking::Track()
 
     UpdateFrameStatistics();
 }
+bool Tracking::CheckInitializationQuality(int &nValidDepthPoints, int &nOccupiedCells)
+{
+    // 针对扑翼飞行机器人航拍场景（50m高空：特征多但有效视差少）：
+    // 用"有效深度点数量 + 空间分布覆盖率"替代单纯的特征点总数门槛。
+    const int minFeatures = (mpORBextractorLeft && mpORBextractorLeft->GetMaxFeatures() > 0) ?
+                            (int)(mpORBextractorLeft->GetMaxFeatures() * 0.3f) : 300;
+    const int minEffective3D = 100;
+    const float minGridCoverage = 0.2f;
+
+    nValidDepthPoints = 0;
+
+    const int nGridCols = 10, nGridRows = 10;
+    vector<bool> vGridOccupancy(nGridCols * nGridRows, false);
+
+    const float cellW = (mCurrentFrame.mnMaxX - mCurrentFrame.mnMinX) / (float)nGridCols;
+    const float cellH = (mCurrentFrame.mnMaxY - mCurrentFrame.mnMinY) / (float)nGridRows;
+    if(cellW <= 0.f || cellH <= 0.f)
+        return false;
+
+    for(int i = 0; i < mCurrentFrame.N; i++)
+    {
+        if(mCurrentFrame.mvDepth[i] <= 0)
+            continue;
+        nValidDepthPoints++;
+
+        int gridX = (int)((mCurrentFrame.mvKeys[i].pt.x - mCurrentFrame.mnMinX) / cellW);
+        int gridY = (int)((mCurrentFrame.mvKeys[i].pt.y - mCurrentFrame.mnMinY) / cellH);
+        gridX = std::max(0, std::min(gridX, nGridCols - 1));
+        gridY = std::max(0, std::min(gridY, nGridRows - 1));
+        vGridOccupancy[gridY * nGridCols + gridX] = true;
+    }
+
+    nOccupiedCells = 0;
+    for(size_t k = 0; k < vGridOccupancy.size(); k++)
+        if(vGridOccupancy[k])
+            nOccupiedCells++;
+
+    const float coverage = (float)nOccupiedCells / (float)(nGridCols * nGridRows);
+
+    const bool condA = mCurrentFrame.N > minFeatures;
+    const bool condB = nValidDepthPoints > minEffective3D;
+    const bool condC = coverage > minGridCoverage;
+
+    if(!condA || !condB || !condC)
+    {
+        cout << "[StereoInit] Skipped: N=" << mCurrentFrame.N
+             << " Valid3D=" << nValidDepthPoints
+             << " Coverage=" << coverage << endl;
+    }
+    return condA && condB && condC;
+}
+
 void Tracking::StereoInitialization()
 {
-    if(mCurrentFrame.N>500)
+    int nValid3D = 0, nCells = 0;
+    if(CheckInitializationQuality(nValid3D, nCells))
     {
         if (mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
         {
@@ -2886,6 +3021,7 @@ void Tracking::StereoInitialization()
 
         // Create KeyFrame
         KeyFrame* pKFini = new KeyFrame(mCurrentFrame,mpAtlas->GetCurrentMap(),mpKeyFrameDB);
+        UpdateKeyFrameSemanticSummary(pKFini);   // 语义概要
 
         // Insert KeyFrame in the map
         mpAtlas->AddKeyFrame(pKFini);
@@ -2895,8 +3031,23 @@ void Tracking::StereoInitialization()
             for(int i=0; i<mCurrentFrame.N;i++)
             {
                 float z = mCurrentFrame.mvDepth[i];
-                if(z>0)
+                // 深度合理性门控：太近/太远的立体点不建图（长短焦模式）
+                if(z > mfMinDepth && z < mfMaxDepth)
                 {
+                    // 相机上方+超视界门控：初始位姿为恒等，主点上方(v<cy)且
+                    // 深度超过 mAboveCameraGate(~100m) 的点已超出可见地面范围，
+                    // 不建图。（远处地面投影在主点上方是正常的，不能整片剔除）
+                    if(Frame::mbGateAboveCamera &&
+                       mCurrentFrame.mvKeys[i].pt.y < Frame::cy &&
+                       z > ORB_SLAM3::Frame::mAboveCameraGate)
+                        continue;
+                    // 主点下方超远门控：v>cy 且 z 超远（>60m）物理上不可能
+                    // （45°俯视下主点下方地面最远~50m），不建图，避免初始化
+                    // 地图被假远点污染、平面拟合高度严重偏小。
+                    if(Frame::mbGateAboveCamera &&
+                       mCurrentFrame.mvKeys[i].pt.y > Frame::cy &&
+                       z > ORB_SLAM3::Frame::mBelowPrincipalGate)
+                        continue;
                     Eigen::Vector3f x3D;
                     mCurrentFrame.UnprojectStereo(i, x3D);
                     MapPoint* pNewMP = new MapPoint(x3D, pKFini, mpAtlas->GetCurrentMap());
@@ -2954,6 +3105,10 @@ void Tracking::StereoInitialization()
         mpAtlas->GetCurrentMap()->mvpKeyFrameOrigins.push_back(pKFini);
 
         mpMapDrawer->SetCurrentCameraPose(mCurrentFrame.GetPose());
+
+        // 记录初始化帧ID：让地面平面拟合（CollectGroundPlaneData/FitGroundPlane）
+        // 在双目/长短焦模式下同样生效，用平面先验锚定尺度、抑制转向时尺度退化
+        mMonoInitFrameId = mCurrentFrame.mnId;
 
         mState=OK;
     }
@@ -3107,13 +3262,15 @@ void Tracking::MonocularInitialization()
                     centroid3f *= (1.0f / vGroundPts.size());
                     Eigen::Vector3f centroid(centroid3f.x, centroid3f.y, centroid3f.z);
 
-                    // 质心必须在相机前方和下方（相机坐标系：X→右, Y→↓, Z→前）
-                    // 扑翼飞行场景：地面在下方，Z>0（前方）且 Y>0（下方）
-                    // if(centroid.z() < 0.2f || centroid.y() < 0.0f) {
-                    if(centroid.z() < 0.2f) {    
+                    // 质心必须在相机前方（相机坐标系：X→右, Y→↓, Z→前）。
+                    // 注意：45° 俯视下地面点会同时分布在相机上方(Y<0，远地面)和
+                    // 下方(Y>0，近地面)，质心 Y 可正可负，不能作为判据；
+                    // 真正必须满足的是点在相机前方 Z>0（两视图重建选错 cheirality
+                    // 时点云会翻到相机后方，这里拦截）。
+                    if(centroid.z() < 0.2f) {
                         cout << "[InitCheck] FAIL: 点云质心位置异常 "
-                             << "Y=" << centroid.y() << " (需>0, 点在相机上方)"
-                             << " Z=" << centroid.z() << " (需>0.2)"
+                             << "Z=" << centroid.z() << " (需>0.2, 点云在相机后方)"
+                             << " Y=" << centroid.y() << " (45°俯视下可正可负，不作判据)"
                              << " 总计" << vGroundPts.size() << "点" << endl;
                         mbReadyToInitializate = false;
                         return;
@@ -3146,11 +3303,16 @@ void Tracking::MonocularInitialization()
                     if(ny < 0) { nx = -nx; ny = -ny; nz = -nz; }
 
                     if(bSVDValid) {
-                        // 可靠平面：检查法向量方向
+                        // 可靠平面：检查法向量方向。
+                        // 相机俯视 θ 时，真实地面的法向量在相机系为 (0, cosθ, -sinθ)：
+                        // θ=0 → (0,1,0)，θ=45° → (0,0.707,-0.707)，θ→90° → (0,0,-1)。
+                        // 原 MIN_NORMAL_Z=-0.3 只接受俯角≤~17°，45° 俯视场景必然被拒；
+                        // 放宽到 -0.95（俯角≤~72°），仍能拦截“平面竖在相机面前/法向量
+                        // 完全指向后方”的退化重建。
                         float yScore = ny;
                         float zScore = nz;
-                        const float MIN_NORMAL_Y = 0.2f;            // 放宽至0.2（斜向下看地面时法向量Y分量会减小）
-                        const float MIN_NORMAL_Z = -0.3f;           // 放宽至-0.3
+                        const float MIN_NORMAL_Y = 0.2f;            // 法向量需有向下的分量（俯角≤~78°）
+                        const float MIN_NORMAL_Z = -0.95f;          // 允许 45° 俯视（nz≈-0.707），拦截极端退化
 
                         if(yScore < MIN_NORMAL_Y || zScore < MIN_NORMAL_Z) {
                             cout << "[InitCheck] FAIL: 平面法向量不正常 n=("
@@ -3168,7 +3330,7 @@ void Tracking::MonocularInitialization()
                              << ") SV比值=" << svRatio << " 点数=" << vGroundPts.size() << endl;
                     } else {
                         // SVD退化：平面拟合不可靠，仅依赖质心位置判断
-                        // 质心Y>0、Z>0 已在上方检查通过，此处仅放松通过
+                        // 质心Z>0 已在前方检查通过，此处仅放松通过
                         cout << "[InitCheck] 地面平面 PASS(退化): centroid=("
                              << centroid.x() << "," << centroid.y() << "," << centroid.z()
                              << ") SV比值=" << svRatio << " 点数=" << vGroundPts.size()
@@ -3231,7 +3393,6 @@ bool Tracking::CheckInitializationHealth(KeyFrame* pKF1, KeyFrame* pKF2)
 
     // 获取两帧的相机内参
     const float fx1 = pKF1->fx, fy1 = pKF1->fy, cx1 = pKF1->cx, cy1 = pKF1->cy;
-    const float fx2 = pKF2->fx, fy2 = pKF2->fy, cx2 = pKF2->cx, cy2 = pKF2->cy;
 
     // 计算帧间变换 T21 = T2w * T1w^{-1}
     // 表示从第一帧相机坐标系到第二帧相机坐标系的变换
@@ -3419,6 +3580,10 @@ void Tracking::CreateInitialMapMonocular()
     // 第一步：创建关键帧
     KeyFrame* pKFini = new KeyFrame(mInitialFrame,mpAtlas->GetCurrentMap(),mpKeyFrameDB);  // 初始化帧关键帧
     KeyFrame* pKFcur = new KeyFrame(mCurrentFrame,mpAtlas->GetCurrentMap(),mpKeyFrameDB);  // 当前帧关键帧
+
+    // 语义概要（回环/重定位语义校验用）；初始化两帧接近，用当前帧检测框
+    UpdateKeyFrameSemanticSummary(pKFini);
+    UpdateKeyFrameSemanticSummary(pKFcur);
 
     // IMU单目模式特殊处理：初始化帧的IMU预积分设为空
     if(mSensor == System::IMU_MONOCULAR)
@@ -3683,23 +3848,43 @@ bool Tracking::TrackReferenceKeyFrame()
     CollectFrameMatches();
     // ============================================================================
 
+    std::chrono::steady_clock::time_point tSemStart;
+    if (gEnableTimingStats) tSemStart = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point tSemSub;
     if(mCurrentFrame.mnId != mnLastDynamicCheckFrameId)
     {
         // 计算振动指标
+        if (gEnableTimingStats) tSemSub = std::chrono::steady_clock::now();
         CalculateVibrationMetrics();
+        if (gEnableTimingStats) mdCurSemVibrationMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(std::chrono::steady_clock::now() - tSemSub).count();
 
         // 检测动态语义特征点
+        if (gEnableTimingStats) tSemSub = std::chrono::steady_clock::now();
         DetectDynamicPoints();
+        if (gEnableTimingStats) mdCurSemDynamicMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(std::chrono::steady_clock::now() - tSemSub).count();
+
+        // 地面平面数据收集：不依赖动态点分类结果（检测框为空时也能收集全点）
+        if (gEnableTimingStats) tSemSub = std::chrono::steady_clock::now();
+        CollectGroundPlaneData();
+
+        // 每30帧刷新平面点标记（让平面约束在BA中生效，同样不依赖检测结果）
+        PlaneRemark();
+        if (gEnableTimingStats) mdCurSemGroundMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(std::chrono::steady_clock::now() - tSemSub).count();
 
         // 3D检测框提升（可选，默认关闭）
+        if (gEnableTimingStats) tSemSub = std::chrono::steady_clock::now();
         if(mbEnable3DBoxDetection)
             Lift2DBoxesTo3D();
+        if (gEnableTimingStats) mdCurSemLiftMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(std::chrono::steady_clock::now() - tSemSub).count();
 
         // 更新最后动态检查帧ID,每一帧只运行一次振动指标计算和动态点检测检测
         mnLastDynamicCheckFrameId = mCurrentFrame.mnId;
     // }else{
     //     cout << "当前帧已进行过振动指标计算和动态点检测，无需重复检测" << endl;
     }
+    if (gEnableTimingStats)
+        mdCurSemanticMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+            std::chrono::steady_clock::now() - tSemStart).count();
 
     
     // 使用所有匹配点优化当前帧的位姿（PnP优化）
@@ -3905,21 +4090,41 @@ bool Tracking::TrackWithMotionModel()
     CollectFrameMatches();
     // ============================================================================
 
+    std::chrono::steady_clock::time_point tSemStart2;
+    if (gEnableTimingStats) tSemStart2 = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point tSemSub2;
     if(mCurrentFrame.mnId != mnLastDynamicCheckFrameId)
     {
         // 计算振动指标
+        if (gEnableTimingStats) tSemSub2 = std::chrono::steady_clock::now();
         CalculateVibrationMetrics();
+        if (gEnableTimingStats) mdCurSemVibrationMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(std::chrono::steady_clock::now() - tSemSub2).count();
         
         // 检测动态语义特征点
+        if (gEnableTimingStats) tSemSub2 = std::chrono::steady_clock::now();
         DetectDynamicPoints();
+        if (gEnableTimingStats) mdCurSemDynamicMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(std::chrono::steady_clock::now() - tSemSub2).count();
+
+        // 地面平面数据收集：不依赖动态点分类结果
+        if (gEnableTimingStats) tSemSub2 = std::chrono::steady_clock::now();
+        CollectGroundPlaneData();
+
+        // 每30帧刷新平面点标记
+        PlaneRemark();
+        if (gEnableTimingStats) mdCurSemGroundMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(std::chrono::steady_clock::now() - tSemSub2).count();
 
         // 3D检测框提升（可选，默认关闭）
+        if (gEnableTimingStats) tSemSub2 = std::chrono::steady_clock::now();
         if(mbEnable3DBoxDetection)
             Lift2DBoxesTo3D();
+        if (gEnableTimingStats) mdCurSemLiftMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(std::chrono::steady_clock::now() - tSemSub2).count();
 
         // 更新最后动态检查帧ID,每一帧只运行一次振动指标计算和动态点检测检测
         mnLastDynamicCheckFrameId = mCurrentFrame.mnId;
     }
+    if (gEnableTimingStats)
+        mdCurSemanticMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+            std::chrono::steady_clock::now() - tSemStart2).count();
     
     // 使用所有匹配点优化当前帧的位姿
     Optimizer::PoseOptimization(&mCurrentFrame);
@@ -3999,6 +4204,12 @@ bool Tracking::TrackWithMotionModel()
         // 振动自适应：放宽有效地图点匹配成功条件
         // 基础10，振动大时最低降至6（当前帧振动已计算完毕）
         int nMinMapMatches = std::max(6, static_cast<int>(10 - 2 * std::min(mfCurrentVibrationLevel, 2.0f)));
+
+        // 初始阶段（关键帧还很少）放宽判定：避免"地图稀→不插关键帧→地图更稀"
+        // 的死循环，让系统先建起足够的关键帧和地图点
+        if(mpAtlas && mpAtlas->GetCurrentMap() && mpAtlas->GetCurrentMap()->KeyFramesInMap() <= 3)
+            nMinMapMatches = std::min(nMinMapMatches, 3);
+
         return nmatchesMap>=nMinMapMatches;
     }
 }
@@ -4172,8 +4383,10 @@ bool Tracking::NeedNewKeyFrame()
         return false;
     }
 
-    // 振动抑制：振动幅度过大时不插入关键帧（使用统一的振动等级）
-    if(mbVibrationThresholdsInitialized && mfCurrentVibrationLevel > 2.0f) {
+    // 振动抑制：单目下振动帧不插关键帧（避免坏帧污染地图）。
+    // 双目/长短焦有立体深度，振动时也应建图，否则振动段地图不增长、跟踪更易断开
+    if(mbVibrationThresholdsInitialized && mfCurrentVibrationLevel > 2.0f &&
+       mSensor != System::STEREO && mSensor != System::IMU_STEREO) {
         // cout << "振动抑制：振动等级=" << mfCurrentVibrationLevel << "，不插入关键帧" << endl;
         return false;
     }
@@ -4298,6 +4511,18 @@ bool Tracking::NeedNewKeyFrame()
         return false;
 }
 
+ void Tracking::UpdateKeyFrameSemanticSummary(KeyFrame* pKF)
+{
+    if(!pKF) return;
+    std::vector<int> cnt(10, 0);
+    // 只统计非人类目标（车辆类 2~9）：行人(0)/人群(1) 检测率低且不稳定，
+    // 用车辆类别直方图做回环/重定位语义校验更可靠。
+    for(const Detection& d : mCurrentFrame.detectedBoxes)
+        if(d.class_id >= 2 && d.class_id < 10)
+            cnt[d.class_id]++;
+    pKF->SetSemanticSummary(cnt);
+}
+
 void Tracking::CreateNewKeyFrame()
 {
     if(mpLocalMapper->IsInitializing() && !mpAtlas->isImuInitialized())
@@ -4307,6 +4532,8 @@ void Tracking::CreateNewKeyFrame()
         return;
 
     KeyFrame* pKF = new KeyFrame(mCurrentFrame,mpAtlas->GetCurrentMap(),mpKeyFrameDB);  // 1. 创建KeyFrame对象
+
+    UpdateKeyFrameSemanticSummary(pKF);   // 语义概要（回环/重定位语义校验用）
 
     if(mpAtlas->isImuInitialized()) //  || mpLocalMapper->IsInitializing())
         pKF->bImu = true;
@@ -5032,45 +5259,6 @@ vector<MapPoint*> Tracking::GetLocalMapMPS()
     return mvpLocalMapPoints;
 }
 
-void Tracking::ChangeCalibration(const string &strSettingPath)
-{
-    cv::FileStorage fSettings(strSettingPath, cv::FileStorage::READ);
-    float fx = fSettings["Camera.fx"];
-    float fy = fSettings["Camera.fy"];
-    float cx = fSettings["Camera.cx"];
-    float cy = fSettings["Camera.cy"];
-
-    mK_.setIdentity();
-    mK_(0,0) = fx;
-    mK_(1,1) = fy;
-    mK_(0,2) = cx;
-    mK_(1,2) = cy;
-
-    cv::Mat K = cv::Mat::eye(3,3,CV_32F);
-    K.at<float>(0,0) = fx;
-    K.at<float>(1,1) = fy;
-    K.at<float>(0,2) = cx;
-    K.at<float>(1,2) = cy;
-    K.copyTo(mK);
-
-    cv::Mat DistCoef(4,1,CV_32F);
-    DistCoef.at<float>(0) = fSettings["Camera.k1"];
-    DistCoef.at<float>(1) = fSettings["Camera.k2"];
-    DistCoef.at<float>(2) = fSettings["Camera.p1"];
-    DistCoef.at<float>(3) = fSettings["Camera.p2"];
-    const float k3 = fSettings["Camera.k3"];
-    if(k3!=0)
-    {
-        DistCoef.resize(5);
-        DistCoef.at<float>(4) = k3;
-    }
-    DistCoef.copyTo(mDistCoef);
-
-    mbf = fSettings["Camera.bf"];
-
-    Frame::mbInitialComputations = true;
-}
-
 void Tracking::InformOnlyTracking(const bool &flag)
 {
     mbOnlyTracking = flag;
@@ -5150,11 +5338,6 @@ void Tracking::UpdateFrameIMU(const float s, const IMU::Bias &b, KeyFrame* pCurr
 void Tracking::NewDataset()
 {
     mnNumDataset++;
-}
-
-int Tracking::GetNumberDataset()
-{
-    return mnNumDataset;
 }
 
 int Tracking::GetMatchesInliers()
@@ -5317,7 +5500,6 @@ void Tracking::CalculateVibrationMetrics()
     mfPrevVibrationLevel = mfCurrentVibrationLevel;
 }
 
-
 /**
  * 根据目标检测结果筛选特征点
  * 将特征点分为静态队列和语义队列
@@ -5467,8 +5649,8 @@ Sophus::SE3f Tracking::ComputePoseWithStaticPoints()
     
     // 分解本质矩阵得到旋转和平移
     cv::Mat R, t;
-    int inliers = cv::recoverPose(E, points2, points1, K, R, t, mask);
-    
+    cv::recoverPose(E, points2, points1, K, R, t, mask);
+
     // cout << "静态点 2D-2D 位姿计算完成: 内点=" << inliers << "/" << points1.size() << endl;
     
     // 将 cv::Mat 转换为 Eigen 矩阵
@@ -5603,7 +5785,7 @@ void Tracking::ClassifySemanticPoints(const Sophus::SE3f& staticPose)
     }
     
     // 自适应阈值计算
-    double adaptiveThreshold = 2.0f;  // 基础阈值
+    double adaptiveThreshold = 2.0f;  // 阈值
     
     if(!epipolarDistances.empty()) {
         // 计算中位值（对异常值更鲁棒）
@@ -5739,12 +5921,14 @@ void Tracking::CollectGroundPlaneData()
 {
     if(mbPlaneFitted) return;
     if(mState != OK) return;
-    if(mMonoInitFrameId == 0) return;
+    if(mMonoInitFrameId == ~0UL) return;
 
     long unsigned int framesSinceInit = mCurrentFrame.mnId - mMonoInitFrameId;
     // 自适应：5秒后触发平面拟合（500帧@100fps, 150帧@30fps, 50帧@10fps）
     if(framesSinceInit > 5 * static_cast<long unsigned int>(mMaxFrames)) {
-        FitGroundPlane();
+        // 拟合失败（数据不足/不成面/噪声平面）后 30 帧再重试，避免每帧都跑 SVD+RANSAC
+        if(mCurrentFrame.mnId >= mnPlaneFitNextRetry)
+            FitGroundPlane();
         return;
     }
 
@@ -5783,6 +5967,13 @@ void Tracking::CollectGroundPlaneData()
             mspGroundPoints.insert(mCurrentFrame.mvpMapPoints[i]);
         }
     }
+
+    // 进度打印（每 60 帧一次），便于确认收集/拟合流程在工作
+    if(mCurrentFrame.mnId % 60 == 0)
+        cout << "[PlaneCollect] 帧=" << mCurrentFrame.mnId
+             << " 已收集总点=" << mspAllPoints.size()
+             << " 地面语义点=" << mspGroundPoints.size()
+             << " (5s后触发拟合)" << endl;
 }
 
 /**
@@ -5812,16 +6003,16 @@ void Tracking::FitGroundPlane()
             vAllPoints.push_back(pMP->GetWorldPos());
     }
 
-    if(vAllPoints.size() < 500) {
-        cout << "[FitGroundPlane] 数据不足: 总点=" << vAllPoints.size() << ", 放弃拟合" << endl;
+    if(vAllPoints.size() < 200) {
+        // 数据不足：不清空，继续累积。
+        // 50m 高空立体地图点比单目少，清空会导致永远凑不够而拟合不上
+        cout << "[FitGroundPlane] 数据不足: 总点=" << vAllPoints.size() << " (<200)，继续累积" << endl;
         mbPlaneFitted = false;
-        mspGroundPoints.clear();
-        mspAllPoints.clear();
+        mnPlaneFitNextRetry = mCurrentFrame.mnId + 30;
         return;
     }
 
     // === 第1遍：全点SVD获取初始法向量 ===
-    // 全场景5590+点分布广，SVD条件数远好于140个车辆点
     Eigen::Vector3f allCentroid(0,0,0);
     for(const auto& p : vAllPoints) allCentroid += p;
     allCentroid /= static_cast<float>(vAllPoints.size());
@@ -5829,6 +6020,7 @@ void Tracking::FitGroundPlane()
     Eigen::MatrixXf A_all(vAllPoints.size(), 3);
     for(size_t i = 0; i < vAllPoints.size(); i++)
         A_all.row(i) = (vAllPoints[i] - allCentroid).transpose();
+
     Eigen::JacobiSVD<Eigen::MatrixXf> svdAll(A_all, Eigen::ComputeFullV);
     Eigen::Vector3f initNormal = svdAll.matrixV().col(2);
     initNormal.normalize();
@@ -5843,49 +6035,190 @@ void Tracking::FitGroundPlane()
     float sceneScale = 0;
     for(const auto& p : vAllPoints) sceneScale = max(sceneScale, (p - allCentroid).norm());
 
-    // === 第2遍：用initNormal排序所有点，取底部60%做SVD精化 ===
-    vector<pair<float, size_t>> vProjIdx;
-    vProjIdx.reserve(vAllPoints.size());
-    for(size_t i = 0; i < vAllPoints.size(); i++)
-        vProjIdx.emplace_back(initNormal.dot(vAllPoints[i]), i);
-    sort(vProjIdx.begin(), vProjIdx.end());
+    // 单目/双目隔离：单目地图尺度任意（非米制），RANSAC 阈值、相机高度门控
+    // 都按米制尺度调参，不适用于单目；单目/RGBD 保持原 bottom-60% SVD 路径，
+    // 双目/长短焦（米制尺度）使用 2026-08 的 RANSAC 改进路径。
+    const bool bStereoFit = (mSensor == System::STEREO || mSensor == System::IMU_STEREO);
 
-    size_t lowCount = max(size_t(100), vAllPoints.size() * 60 / 100);
-    vector<Eigen::Vector3f> vLowPoints;
-    vLowPoints.reserve(lowCount);
-    for(size_t i = 0; i < lowCount; i++)
-        vLowPoints.push_back(vAllPoints[vProjIdx[i].second]);
+    Eigen::Vector3f planeNormal = initNormal;
+    float mainOffset = 0.f;
+    float camHeight = 0.f;
+    int nFitPts = 0;   // 诊断：RANSAC内点数（双目）或底部点数（单目）
 
-    Eigen::Vector3f lowCentroid(0,0,0);
-    for(const auto& p : vLowPoints) lowCentroid += p;
-    lowCentroid /= static_cast<float>(lowCount);
+    if(bStereoFit)
+    {
+        // === 预清洗：按到质心的距离做稳健裁剪（中位数 + 5×MAD） ===
+        // 弱视差三角化/假匹配会产生离群数百单位的点，直接参与拟合会把平面带歪。
+        // MAD（中位数绝对偏差）对离群点稳健，保留核心点云。
+        {
+            vector<float> vD(vAllPoints.size());
+            for(size_t i = 0; i < vAllPoints.size(); i++)
+                vD[i] = (vAllPoints[i] - allCentroid).norm();
+            const size_t mid = vD.size() / 2;
+            std::nth_element(vD.begin(), vD.begin() + mid, vD.end());
+            const float medDist = vD[mid];
+            vector<float> vAbs(vD.size());
+            for(size_t i = 0; i < vD.size(); i++) vAbs[i] = std::abs(vD[i] - medDist);
+            std::nth_element(vAbs.begin(), vAbs.begin() + mid, vAbs.end());
+            const float mad = vAbs[mid];
+            const float cut = medDist + 5.0f * mad;
+            vector<Eigen::Vector3f> vTrim;
+            vTrim.reserve(vAllPoints.size());
+            for(size_t i = 0; i < vAllPoints.size(); i++)
+                if(vD[i] < cut) vTrim.push_back(vAllPoints[i]);
+            cout << "[FitGroundPlane] 远点裁剪: " << vTrim.size() << "/" << vAllPoints.size()
+                 << " (medDist=" << medDist << " MAD=" << mad << " cut=" << cut << ")" << endl;
+            if(vTrim.size() >= 200)
+                vAllPoints.swap(vTrim);   // 裁剪后仍够点才采用，否则保留全部继续
+        }
 
-    Eigen::MatrixXf A_low(lowCount, 3);
-    for(size_t i = 0; i < lowCount; i++)
-        A_low.row(i) = (vLowPoints[i] - lowCentroid).transpose();
-    Eigen::JacobiSVD<Eigen::MatrixXf> svdLow(A_low, Eigen::ComputeFullV);
-    Eigen::Vector3f planeNormal = svdLow.matrixV().col(2);
-    planeNormal.normalize();
-    if(planeNormal.dot(initNormal) < 0) planeNormal = -planeNormal;
+        // === RANSAC 主平面拟合 ===
+        // 原来的“按 initNormal 排序取底部60%”依赖被远点污染的 initNormal，
+        // 逐次运行会在两个解之间翻转（实测平面高度 2.88 vs 10.2，法向量甚至反向）。
+        // RANSAC 直接找内点最多的平面，对离群点稳健；再用内点 SVD 精化。
+        const float ransacThresh = std::min(std::max(0.04f * sceneScale, 1.0f), 3.0f);
+        const size_t nPts = vAllPoints.size();
+        const int nRansacIter = 120;
+        std::mt19937 rng(20260812u);   // 固定种子：同一帧点集下结果确定
 
-    // === 角度门控：精化法向量偏离initNormal >25° 则拒绝 ===
-    float angleCos = std::abs(initNormal.dot(planeNormal));
-    if(angleCos < 0.9063f) {  // cos(25°)
-        cout << "[FitGroundPlane] 精化法向量偏离全点方向 " << acos(angleCos)*180.0/M_PI
-             << "°, 回退到全点方向" << endl;
-        planeNormal = initNormal;
+        int bestInliers = 0;
+        std::vector<char> vBestMask(nPts, 0);
+        for(int iter = 0; iter < nRansacIter; iter++)
+        {
+            size_t i0 = rng() % nPts, i1 = rng() % nPts, i2 = rng() % nPts;
+            if(i0 == i1 || i0 == i2 || i1 == i2) continue;
+            const Eigen::Vector3f& a = vAllPoints[i0];
+            Eigen::Vector3f n = (vAllPoints[i1] - a).cross(vAllPoints[i2] - a);
+            const float nl = n.norm();
+            if(nl < 1e-6f) continue;
+            n /= nl;
+            if(n.dot(initNormal) < 0) n = -n;
+            const float off = n.dot(a);
+            int cnt = 0;
+            for(size_t i = 0; i < nPts; i++)
+                if(std::abs(n.dot(vAllPoints[i]) - off) < ransacThresh) cnt++;
+            if(cnt > bestInliers)
+            {
+                bestInliers = cnt;
+                for(size_t i = 0; i < nPts; i++)
+                    vBestMask[i] = (std::abs(n.dot(vAllPoints[i]) - off) < ransacThresh) ? 1 : 0;
+            }
+        }
+
+        // 内点比例门槛：主平面内点太少说明点云不成面（跟踪差/地图散），拒绝并稍后重试
+        if(bestInliers < 300 || bestInliers < (int)nPts / 4)
+        {
+            cout << "[FitGroundPlane] 拒绝: RANSAC内点=" << bestInliers << "/" << nPts
+                 << " (<300或<25%)，点云不成面，继续累积" << endl;
+            mbPlaneFitted = false;
+            mnPlaneFitNextRetry = mCurrentFrame.mnId + 30;
+            return;
+        }
+
+        // 对 RANSAC 内点做 SVD 精化（比单次三点采样平面更准）
+        vector<Eigen::Vector3f> vInliers;
+        vInliers.reserve(bestInliers);
+        Eigen::Vector3f inlCentroid(0, 0, 0);
+        for(size_t i = 0; i < nPts; i++)
+        {
+            if(!vBestMask[i]) continue;
+            vInliers.push_back(vAllPoints[i]);
+            inlCentroid += vAllPoints[i];
+        }
+        inlCentroid /= (float)bestInliers;
+
+        Eigen::MatrixXf A_inl(bestInliers, 3);
+        for(int i = 0; i < bestInliers; i++)
+            A_inl.row(i) = (vInliers[i] - inlCentroid).transpose();
+        Eigen::JacobiSVD<Eigen::MatrixXf> svdInl(A_inl, Eigen::ComputeFullV);
+        planeNormal = svdInl.matrixV().col(2);
+        planeNormal.normalize();
+        if(planeNormal.dot(initNormal) < 0) planeNormal = -planeNormal;
+
+        // 角度门控：精化法向量偏离全点方向 >25° 则回退全点方向
+        float angleCos = std::abs(initNormal.dot(planeNormal));
+        Eigen::Vector3f planeRefCentroid = inlCentroid;
+        if(angleCos < 0.9063f) {  // cos(25°)
+            cout << "[FitGroundPlane] 精化法向量偏离全点方向 " << acos(angleCos)*180.0/M_PI
+                 << "°, 回退到全点方向" << endl;
+            planeNormal = initNormal;
+            // 回退时偏移参考改用裁剪后全部点的质心
+            planeRefCentroid.setZero();
+            for(const auto& p : vAllPoints) planeRefCentroid += p;
+            planeRefCentroid /= (float)nPts;
+        }
+
+        // === 偏移量：平面必经内点（或回退时的全点）质心 ===
+        mainOffset = planeNormal.dot(planeRefCentroid);
+
+        // === 相机上方验证 ===
+        camHeight = planeNormal.dot(camCenter) - mainOffset;
+        if(camHeight < 0) {
+            planeNormal = -planeNormal;
+            mainOffset = -mainOffset;
+            camHeight = -camHeight;
+        }
+
+        // === 高度合理性门控：拒绝贴近相机的噪声平面 ===
+        // 50m 场景在拟合时（约5s，尺度≈1）相机高度应达数十单位；
+        // <5 单位说明拟合到了贴近相机的噪声平面（实测坏拟合仅 2.88），
+        // 拒绝并保留数据，30 帧后重试，而不是把错误平面写进地图。
+        if(camHeight < 5.0f)
+        {
+            cout << "[FitGroundPlane] 拒绝: 相机高度=" << camHeight
+                 << " <5，疑似噪声平面，继续累积" << endl;
+            mbPlaneFitted = false;
+            mnPlaneFitNextRetry = mCurrentFrame.mnId + 30;
+            return;
+        }
+        nFitPts = bestInliers;
     }
+    else
+    {
+        // === 单目原路径：bottom-60% SVD ===
+        vector<pair<float, size_t>> vProjIdx;
+        vProjIdx.reserve(vAllPoints.size());
+        for(size_t i = 0; i < vAllPoints.size(); i++)
+            vProjIdx.emplace_back(initNormal.dot(vAllPoints[i]), i);
+        sort(vProjIdx.begin(), vProjIdx.end());
 
-    // === 偏移量：SVD中心化数据拟合的平面必经 lowCentroid ===
-    // planeNormal · (P - lowCentroid) = 0  →  offset = planeNormal · lowCentroid
-    float mainOffset = planeNormal.dot(lowCentroid);
+        size_t lowCount = max(size_t(100), vAllPoints.size() * 60 / 100);
+        vector<Eigen::Vector3f> vLowPoints;
+        vLowPoints.reserve(lowCount);
+        for(size_t i = 0; i < lowCount; i++)
+            vLowPoints.push_back(vAllPoints[vProjIdx[i].second]);
 
-    // === 相机上方验证 ===
-    float camHeight = planeNormal.dot(camCenter) - mainOffset;
-    if(camHeight < 0) {
-        planeNormal = -planeNormal;
-        mainOffset = -mainOffset;
-        camHeight = -camHeight;
+        Eigen::Vector3f lowCentroid(0, 0, 0);
+        for(const auto& p : vLowPoints) lowCentroid += p;
+        lowCentroid /= static_cast<float>(lowCount);
+
+        Eigen::MatrixXf A_low(lowCount, 3);
+        for(size_t i = 0; i < lowCount; i++)
+            A_low.row(i) = (vLowPoints[i] - lowCentroid).transpose();
+        Eigen::JacobiSVD<Eigen::MatrixXf> svdLow(A_low, Eigen::ComputeFullV);
+        planeNormal = svdLow.matrixV().col(2);
+        planeNormal.normalize();
+        if(planeNormal.dot(initNormal) < 0) planeNormal = -planeNormal;
+
+        // 角度门控：精化法向量偏离initNormal >25° 则回退全点方向
+        float angleCos = std::abs(initNormal.dot(planeNormal));
+        if(angleCos < 0.9063f) {  // cos(25°)
+            cout << "[FitGroundPlane] 精化法向量偏离全点方向 " << acos(angleCos)*180.0/M_PI
+                 << "°, 回退到全点方向" << endl;
+            planeNormal = initNormal;
+        }
+
+        // === 偏移量：SVD中心化数据拟合的平面必经 lowCentroid ===
+        mainOffset = planeNormal.dot(lowCentroid);
+
+        // === 相机上方验证 ===
+        camHeight = planeNormal.dot(camCenter) - mainOffset;
+        if(camHeight < 0) {
+            planeNormal = -planeNormal;
+            mainOffset = -mainOffset;
+            camHeight = -camHeight;
+        }
+        nFitPts = (int)lowCount;
     }
 
     // === 写入Map ===
@@ -5895,7 +6228,7 @@ void Tracking::FitGroundPlane()
 
     cout << "[FitGroundPlane] 完成! 语义点=" << vGroundPoints.size()
          << " 总点=" << vAllPoints.size()
-         << " 低部点=" << lowCount
+         << (bStereoFit ? " RANSAC内点=" : " 低部点=") << nFitPts
          << " 场景尺度=" << sceneScale
          << " 法向量=(" << planeNormal(0) <<","<< planeNormal(1) <<","<< planeNormal(2) <<")"
          << " 偏移=" << mainOffset
@@ -5903,7 +6236,11 @@ void Tracking::FitGroundPlane()
 
     // 宽阈值标记平面点（8%场景尺度）：标足够的点让 BA 尺度假感受力
     // info=50 意味着 1σ≈0.14 单位，即 ±10% d 的容忍度，不会锁死正常高度波动
-    const float depthThreshold = max(0.08f * sceneScale, 0.08f);
+    // 2026-08 修复：远点污染时 sceneScale 会很大（如 260），0.08×sceneScale≈21 会把
+    // 离平面 21 个单位的点都标成"平面点"，BA 平面约束把它们拉到拟合平面上，
+    // 相机跟着跳 → 轨迹在平面创建时刻出现断层/高度突变。阈值封顶 3 个单位，
+    // 只标记真正贴近平面的点（真实地面/车辆点都在 3 以内）。
+    const float depthThreshold = std::min(std::max(0.08f * sceneScale, 0.08f), 3.0f);
     {
         vector<MapPoint*> vpAllMPs = pMap->GetAllMapPoints();
         int nPlanePts = 0;
@@ -5914,7 +6251,7 @@ void Tracking::FitGroundPlane()
             float minD = std::abs(signedD - mainOffset);
             pMP->mfPlaneDistance = minD;
             pMP->mnPlaneID = (minD < depthThreshold) ? 0 : -1;
-            if(pMP->mnPlaneID >= 0) pMP->mfPlaneInfo = 1.0f;
+            if(pMP->mnPlaneID >= 0) pMP->mfPlaneInfo = 0.15f;   // 拟合完成初期弱约束，PlaneRemark 逐步加强
             if(pMP->mnPlaneID >= 0) nPlanePts++;
         }
         cout << "[FitGroundPlane] 平面点=" << nPlanePts << " 阈值=" << depthThreshold << endl;
@@ -5924,6 +6261,8 @@ void Tracking::FitGroundPlane()
     mspGroundPoints.clear();
     mspAllPoints.clear();
 
+    mnPlaneFitFrameId = mCurrentFrame.mnId;
+    mnPlaneLowLambdaStreak = 0;   // 新平面重新计“连续低λ”轮数
     mbPlaneFitted = true;
 }
 
@@ -5989,6 +6328,321 @@ void Tracking::ProjectPlanePoints()
  */
 void Tracking::Lift2DBoxesTo3D()
 {
+    // 长短焦模式：用左右目匹配+前后帧匹配特征点计算 3D 框（默认开启）
+    if(ORB_SLAM3::Frame::mbMultiFocal)
+        Lift2DBoxesTo3D_Stereo();
+    else
+        Lift2DBoxesTo3D_Mono();   // 单目模式：原实现（默认关闭）
+
+    // 持续维护：同类成排目标微调位置/朝向（内部有10帧频率控制）
+    AlignBoxRows();
+}
+
+/**
+ * 持续维护：同类目标成排时，微调位置与朝向。
+ * 适用场景：路侧停靠/排队车辆——中心彼此接近且大体共线，朝向应一致。
+ * 逻辑（阈值全部为"类别物理尺寸×尺度"的相对量，且只作用于当前视野内的框）：
+ *   1. 同类、视野内有效框按中心距离做贪心局部聚类（半径 clusterCoeff×车长）；
+ *   2. 每组≥minGroup 时，对平面内中心做 RANSAC 直线拟合（横向容差 lineCoeff×车长）；
+ *   3. 还需满足：内点比例≥inlierRatio，且内点纵向散布 ≥ elongRatio×横向散布
+ *      （线状性判据，排除成片/成团分布）；
+ *   4. 仅对"内点"做软投影（未冻结 pullNormal，冻结 pullFrozen），单次位移不超过
+ *      maxShiftFactor×车宽，朝向统一为直线方向（车长轴，方向无关）。
+ */
+void Tracking::AlignBoxRows()
+{
+    Map* pMap = mpAtlas->GetCurrentMap();
+    if(!pMap || !pMap->IsPlaneEstimated()) return;
+
+    // 频率：每30帧维护一次
+    if(mCurrentFrame.mnId - mnLastAlignRowsFrameId < 30)
+        return;
+    mnLastAlignRowsFrameId = mCurrentFrame.mnId;
+
+    // ===== 成排对齐参数 =====
+    // 注意：所有距离阈值都必须是"类别物理尺寸 × 尺度"的相对量。
+    // 之前用 clusterMin/lineMin 这类 SLAM 单位的绝对下限，在当前尺度
+    // (scaleToSlam≈0.017) 下相当于几十米，会把所有同类框串成一组并对齐。
+    const float clusterCoeff   = 2.0f;   // 聚类半径 = clusterCoeff × 车长（放宽：容纳车距较大的排队）
+    const float lineCoeff      = 0.30f;  // 直线横向容差 = lineCoeff × 车长（放宽：允许轻微不共线）
+    const float inlierRatio    = 0.70f;  // 内点占比阈值（放宽：更易判为成排）
+    const float elongRatio     = 1.5f;   // 纵向/横向散布比下限（放宽：弱化线状性要求）
+    const float pullFrozen     = 0.15f;  // 已冻结框的软投影系数（加大）
+    const float pullNormal     = 0.30f;  // 未冻结框的软投影系数（加大）
+    const float maxShiftFactor = 1.0f;   // 单次位移上限 = maxShiftFactor × 车宽（放宽）
+    const int   minGroup       = 3;
+    // ===== 参数区结束 =====
+
+    std::vector<Detection3D> boxes = pMap->GetPersistentBoxes();
+    if(boxes.size() < (size_t)minGroup) return;
+
+    const Eigen::Vector3f& n_w = pMap->GetPlaneNormal();
+    const float d_ref = pMap->GetPlaneRefOffset();
+    if(std::abs(d_ref) < 1e-6f) return;
+
+    const float slamHeight = pMap->GetPlaneRefHeight();
+    if(slamHeight < 1e-3f) return;
+    const float scaleToSlam = slamHeight / 50.0f;
+    if(scaleToSlam < 1e-6f) return;
+
+    Eigen::Vector3f ref = (std::abs(n_w.x()) < 0.9f) ? Eigen::Vector3f::UnitX() : Eigen::Vector3f::UnitZ();
+    Eigen::Vector3f e1 = n_w.cross(ref).normalized();
+    Eigen::Vector3f e2 = n_w.cross(e1).normalized();
+
+    // 类别物理尺寸先验（见 common.h CLASS_LENGTH_M / CLASS_WIDTH_M）
+    const float* classW_m = CLASS_WIDTH_M.data();
+    const float* classD_m = CLASS_LENGTH_M.data();
+
+    // 只对齐当前视野内的框：避免对历史/已离开视野的框每 30 帧反复施加拉力
+    const Sophus::SE3f TcwF = mCurrentFrame.GetPose();
+    const float fx = mCurrentFrame.fx, fy = mCurrentFrame.fy;
+    const float cx = mCurrentFrame.cx, cy = mCurrentFrame.cy;
+    auto isInFOV = [&](const Eigen::Vector3f& Pw) -> bool {
+        Eigen::Vector3f Pc = TcwF * Pw;
+        if(Pc.z() < 0.05f) return false;
+        const float u = fx * Pc.x() / Pc.z() + cx;
+        const float v = fy * Pc.y() / Pc.z() + cy;
+        return u >= mCurrentFrame.mnMinX && u < mCurrentFrame.mnMaxX &&
+               v >= mCurrentFrame.mnMinY && v < mCurrentFrame.mnMaxY;
+    };
+
+    int nAligned = 0;
+    for(int cid = 2; cid <= 9; cid++)
+    {
+        std::vector<int> vIdx;
+        for(size_t i = 0; i < boxes.size(); i++)
+            if(boxes[i].class_id == cid && boxes[i].bValid && isInFOV(boxes[i].center))
+                vIdx.push_back((int)i);
+        if((int)vIdx.size() < minGroup) continue;
+
+        const float clusterThresh = clusterCoeff * classD_m[cid] * scaleToSlam;
+        const float lineTh        = lineCoeff    * classD_m[cid] * scaleToSlam;
+        if(clusterThresh < 1e-6f || lineTh < 1e-6f) continue;
+
+        // 贪心局部聚类（同类、中心距离 < clusterThresh 归为一组）
+        std::vector<char> vUsed(vIdx.size(), 0);
+        for(size_t si = 0; si < vIdx.size(); si++)
+        {
+            if(vUsed[si]) continue;
+            std::vector<int> group;
+            group.push_back((int)si);
+            vUsed[si] = 1;
+            bool bGrow = true;
+            while(bGrow)
+            {
+                bGrow = false;
+                for(size_t j = 0; j < vIdx.size(); j++)
+                {
+                    if(vUsed[j]) continue;
+                    for(int g : group)
+                    {
+                        if((boxes[vIdx[j]].center - boxes[vIdx[g]].center).norm() < clusterThresh)
+                        {
+                            vUsed[j] = 1;
+                            group.push_back((int)j);
+                            bGrow = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if((int)group.size() < minGroup) continue;
+
+            // 组内平面内2D中心
+            std::vector<Eigen::Vector2f> vP(group.size());
+            for(size_t k = 0; k < group.size(); k++)
+            {
+                const Eigen::Vector3f& c = boxes[vIdx[group[k]]].center;
+                vP[k] = Eigen::Vector2f(e1.dot(c), e2.dot(c));
+            }
+
+            // RANSAC 直线拟合（2点采样，横向容差 lineTh）
+            float bestR = 0.f, bestA = 0.f, bestB = 0.f, bestC = 0.f;
+            int bestN = 0;
+            const int nIter = std::min(80, (int)group.size() * 12);
+            for(int t = 0; t < nIter; t++)
+            {
+                const int i1 = std::rand() % group.size();
+                const int i2 = std::rand() % group.size();
+                if(i1 == i2) continue;
+                const float dx = vP[i2].x() - vP[i1].x();
+                const float dy = vP[i2].y() - vP[i1].y();
+                const float L = std::sqrt(dx*dx + dy*dy);
+                if(L < 1e-6f) continue;
+                const float a = -dy / L, b = dx / L, c = -(a*vP[i1].x() + b*vP[i1].y());
+                int in = 0;
+                for(const auto& p : vP)
+                    if(std::abs(a*p.x() + b*p.y() + c) < lineTh) in++;
+                const float r = (float)in / group.size();
+                if(r > bestR) { bestR = r; bestA = a; bestB = b; bestC = c; bestN = in; }
+            }
+            if(bestR < inlierRatio || bestN < minGroup) continue;   // 不成排，不动
+
+            // 线状性判据：只用内点，纵向散布必须显著大于横向散布，
+            // 排除"成片/成团"分布被强行拟合出一条直线的情况。
+            {
+                std::vector<float> vL, vPerp;
+                vL.reserve(group.size());
+                vPerp.reserve(group.size());
+                for(size_t k = 0; k < group.size(); k++)
+                {
+                    const float perp = bestA*vP[k].x() + bestB*vP[k].y() + bestC;
+                    if(std::abs(perp) >= lineTh) continue;      // 仅内点
+                    vL.push_back(vP[k].x()*bestB - vP[k].y()*bestA);
+                    vPerp.push_back(perp);
+                }
+                if((int)vL.size() < minGroup) continue;
+                float meanL = 0.f;
+                for(float x : vL) meanL += x;
+                meanL /= (float)vL.size();
+                float varL = 0.f, varPerp = 0.f;
+                for(size_t k = 0; k < vL.size(); k++)
+                {
+                    varL += (vL[k] - meanL) * (vL[k] - meanL);
+                    varPerp += vPerp[k] * vPerp[k];
+                }
+                varL /= vL.size(); varPerp /= vL.size();
+                const float stdL = std::sqrt(varL);
+                const float stdPerp = std::sqrt(std::max(varPerp, 1e-9f));
+                if(stdL < elongRatio * stdPerp) continue;       // 非线状 → 不动
+            }
+
+            // 直线方向（平面内）：2D方向(b,-a) → 3D e1*b - e2*a
+            Eigen::Vector3f lineDir = (e1*bestB - e2*bestA).normalized();
+
+            // 对齐：只拉内点 + 单次位移上限 + 朝向统一
+            const float maxShift = maxShiftFactor * classW_m[cid] * scaleToSlam;
+            for(size_t k = 0; k < group.size(); k++)
+            {
+                const int idx = vIdx[group[k]];
+                Detection3D& b = boxes[idx];
+                const float d = bestA*vP[k].x() + bestB*vP[k].y() + bestC;
+                if(std::abs(d) >= lineTh) continue;              // 外点不拉，保持原位
+                const float pull = b.bFrozen ? pullFrozen : pullNormal;   // 冻结框更保守
+                const float su = vP[k].x() - bestA*d*pull;
+                const float sv = vP[k].y() - bestB*d*pull;
+                Eigen::Vector3f newC = b.center + e1*(su - vP[k].x()) + e2*(sv - vP[k].y());
+                newC -= n_w * (n_w.dot(newC) - d_ref);
+                Eigen::Vector3f delta = newC - b.center;
+                if(maxShift > 0.f && delta.norm() > maxShift)
+                    delta = delta.normalized() * maxShift;       // 单次位移封顶
+                b.center = b.center + delta;
+                b.center -= n_w * (n_w.dot(b.center) - d_ref);   // 保持在地面上
+                b.heading = lineDir;                             // 整排朝向一致（方向无关轴）
+                nAligned++;
+            }
+        }
+    }
+    if(nAligned > 0)
+        pMap->ReplacePersistentBoxes(boxes);
+}
+
+/**
+ * 单目：由 2D 检测框 + 相机位姿 + 地面平面 反投影出地面足迹。
+ *
+ * 原理（地面假设）：
+ *   50m 航拍近垂直俯视时，目标顶/底投影几乎重合，整框可视作目标在地面的轮廓。
+ *   把 2D 框四角像素发出射线与地面平面求交，得到地面四边形；
+ *   其重心即目标足迹中心（=3D 位置），其主轴/次轴范围即车长/车宽。
+ *   该方法只用位姿与平面，不依赖立体视差或框内地图点，远距离下比点统计稳得多。
+ *
+ * 输出均在同一 SLAM 尺度下（因为交点在平面上，与地图/平面同尺度）。
+ * 失败（未估平面 / 射线与平面不相交 / 四角退化）返回 false，调用方回退旧逻辑。
+ */
+bool Tracking::EstimateGroundFootprintMono(const Detection& det,
+                                           Eigen::Vector3f& P_ctr,
+                                           Eigen::Vector3f& heading,
+                                           float& widthSlam, float& depthSlam)
+{
+    Map* pMap = mpAtlas->GetCurrentMap();
+    if(!pMap || !pMap->IsPlaneEstimated()) return false;
+
+    const Eigen::Vector3f n = pMap->GetPlaneNormal();
+    const float d = pMap->GetPlaneRefOffset();
+    if(std::abs(d) < 1e-6f) return false;
+
+    const Eigen::Matrix3f Rwc = mCurrentFrame.GetRwc();          // 相机 → 世界旋转
+    const Eigen::Vector3f Ow = mCurrentFrame.GetCameraCenter();  // 相机中心(世界)
+    const float fx = mCurrentFrame.fx, fy = mCurrentFrame.fy;
+    const float cx = mCurrentFrame.cx, cy = mCurrentFrame.cy;
+
+    // 像素 → 世界射线 → 与地面平面求交 → 落回平面
+    auto rayGround = [&](float u, float v, Eigen::Vector3f& Pg) -> bool {
+        const Eigen::Vector3f dirC((u - cx) / fx, (v - cy) / fy, 1.0f);
+        const Eigen::Vector3f dirW = Rwc * dirC;
+        const float denom = n.dot(dirW);
+        if(std::abs(denom) < 1e-6f) return false;
+        const float t = (d - n.dot(Ow)) / denom;
+        if(t <= 0.0f) return false;                 // 交点在相机后方
+        Pg = Ow + t * dirW;
+        Pg -= n * (n.dot(Pg) - d);                  // 数值上严格落平面
+        return true;
+    };
+
+    const float x1 = det.bbox.x, y1 = det.bbox.y;
+    const float x2 = x1 + det.bbox.width, y2 = y1 + det.bbox.height;
+    Eigen::Vector3f P00, P10, P11, P01;
+    if(!rayGround(x1, y1, P00) || !rayGround(x2, y1, P10) ||
+       !rayGround(x2, y2, P11) || !rayGround(x1, y2, P01))
+        return false;
+
+    P_ctr = (P00 + P10 + P11 + P01) * 0.25f;
+    P_ctr -= n * (n.dot(P_ctr) - d);
+
+    // 平面内正交基
+    const Eigen::Vector3f ref = (std::abs(n.x()) < 0.9f) ? Eigen::Vector3f::UnitX()
+                                                         : Eigen::Vector3f::UnitZ();
+    const Eigen::Vector3f e1 = n.cross(ref).normalized();
+    const Eigen::Vector3f e2 = n.cross(e1).normalized();
+
+    // 四角在平面坐标系下相对中心的分布
+    const Eigen::Vector2f c2(e1.dot(P_ctr), e2.dot(P_ctr));
+    const Eigen::Vector2f q[4] = {
+        {e1.dot(P00) - c2.x(), e2.dot(P00) - c2.y()},
+        {e1.dot(P10) - c2.x(), e2.dot(P10) - c2.y()},
+        {e1.dot(P11) - c2.x(), e2.dot(P11) - c2.y()},
+        {e1.dot(P01) - c2.x(), e2.dot(P01) - c2.y()}};
+
+    // 2D PCA 主轴
+    float cxx = 0.f, cyy = 0.f, cxy = 0.f;
+    for(int i = 0; i < 4; i++) {
+        cxx += q[i].x() * q[i].x();
+        cyy += q[i].y() * q[i].y();
+        cxy += q[i].x() * q[i].y();
+    }
+    const float tr2 = (cxx + cyy) * 0.5f;
+    const float dlt = std::sqrt(std::max(0.f, (cxx - cyy) * 0.5f * (cxx - cyy) * 0.5f + cxy * cxy));
+    const float l1 = tr2 + dlt;
+    Eigen::Vector2f dir(cxy, l1 - cxx);
+    if(dir.norm() < 1e-6f) return false;
+    dir.normalize();
+    const Eigen::Vector2f perp(-dir.y(), dir.x());
+
+    float aMin = 1e9f, aMax = -1e9f, bMin = 1e9f, bMax = -1e9f;
+    for(int i = 0; i < 4; i++) {
+        const float a = q[i].dot(dir);
+        const float b = q[i].dot(perp);
+        aMin = std::min(aMin, a); aMax = std::max(aMax, a);
+        bMin = std::min(bMin, b); bMax = std::max(bMax, b);
+    }
+    const float eA = std::max(aMax - aMin, 0.005f);
+    const float eB = std::max(bMax - bMin, 0.005f);
+
+    // 长边=车长(depth)，短边=车宽(width)；朝向取长轴（方向无关）
+    if(eA >= eB) {
+        depthSlam = eA;
+        widthSlam = eB;
+        heading = (e1 * dir.x() + e2 * dir.y()).normalized();
+    } else {
+        depthSlam = eB;
+        widthSlam = eA;
+        heading = (e1 * perp.x() + e2 * perp.y()).normalized();
+    }
+    return true;
+}
+
+void Tracking::Lift2DBoxesTo3D_Mono()
+{
     Map* pMap = mpAtlas->GetCurrentMap();
     if(!pMap || !pMap->IsPlaneEstimated()) return;
 
@@ -6006,10 +6660,11 @@ void Tracking::Lift2DBoxesTo3D()
     float scaleToSlam = slamHeight / HEIGHT;
 
     // 类别默认尺寸 (物理米), 通过 scaleToSlam 转为 SLAM 单位
-    // VisDrone: 0、1=pedestrian(跳过), 2=bicycle, 3=car, 4=van, 5=truck, 6=tricycle, 7=awning, 8=bus, 9=motor
-    const float classW_m[10] = {0, 0.5f, 0.5f, 1.8f, 2.0f, 2.5f, 1.2f, 1.2f, 3.0f, 0.5f};
-    const float classD_m[10] = {0, 0.5f, 0.5f, 4.5f, 5.5f, 10.0f, 2.5f, 2.5f, 12.0f, 0.5f};
-    const float classH_m[10] = {0, 1.7f, 1.7f, 1.5f, 2.2f, 3.0f, 2.0f, 2.2f, 3.2f, 1.7f};
+    // 统一先验表见 common.h（CLASS_WIDTH_M / CLASS_LENGTH_M / CLASS_HEIGHT_M）
+    // class_id: 0=pedestrian,1=people,2=bicycle,3=car,4=van,5=truck,6=tricycle,7=awning,8=bus,9=motor
+    const float* classW_m = CLASS_WIDTH_M.data();
+    const float* classD_m = CLASS_LENGTH_M.data();
+    const float* classH_m = CLASS_HEIGHT_M.data();
 
     const int MIN_OBJECT_POINTS = 4;  // 最低物体特征点数量
     const float MAX_HEIGHT_RATIO = 0.5f;  // 物体点最大高度 = 相机高度 * 50%
@@ -6086,11 +6741,16 @@ void Tracking::Lift2DBoxesTo3D()
         // 仅当视野内数量不足时才允许新建框(合并更新不受限)
         bool bAllowNew = nBox3D[ci] < nDet2D[ci];
 
-        // ===== 步骤1: 收集框内的物体特征点 =====
-        std::vector<Eigen::Vector3f> vObjectPts;  // 平面之上的点
-        std::vector<float> vHeights;              // 各点相对平面的高度
-        vObjectPts.reserve(32);
+        // 先验尺寸 (SLAM单位)
+        const float W_prior = classW_m[ci] * scaleToSlam;
+        const float D_prior = classD_m[ci] * scaleToSlam;
+        const float H_prior = classH_m[ci] * scaleToSlam;
+
+        // ===== 步骤1: 收集框内地图点（仅用于"高度"，位置/尺寸走地面反投影）=====
+        std::vector<float> vHeights;            // 各点相对平面的高度
+        std::vector<Eigen::Vector3f> vObjectPts; // 回退路径才用
         vHeights.reserve(32);
+        vObjectPts.reserve(32);
 
         for(int i = 0; i < mCurrentFrame.N; i++) {
             MapPoint* pMP = mCurrentFrame.mvpMapPoints[i];
@@ -6112,87 +6772,89 @@ void Tracking::Lift2DBoxesTo3D()
             }
         }
 
-        // 数量门控
-        if((int)vObjectPts.size() < MIN_OBJECT_POINTS) {
+        const int nPtsLog = (int)vObjectPts.size();   // 仅日志用
+
+        // 高度：框内点中位数优先，点不足则退回类别先验
+        float H = H_prior;
+        if(!vHeights.empty()) {
+            std::sort(vHeights.begin(), vHeights.end());
+            H = vHeights[vHeights.size() / 2];
+        }
+
+        // ===== 步骤2/3: 位置+尺寸 =====
+        //  主路径：地面反投影（不依赖视差/稀疏点，远距离更稳）
+        //  回退  ：旧的地图点分布法（地面反投影失败且点足够时）
+        Eigen::Vector3f P_ctr, heading = Eigen::Vector3f::Zero();
+        float W = W_prior, D = D_prior;
+        const bool bFootprint = EstimateGroundFootprintMono(det, P_ctr, heading, W, D);
+
+        if(bFootprint) {
+            // 反投影对目标高度敏感（顶面使足迹偏大），与先验融合并夹紧兜底
+            W = 0.6f * W + 0.4f * W_prior;
+            D = 0.6f * D + 0.4f * D_prior;
+            W = std::max(W_prior * 0.5f, std::min(W, W_prior * 2.0f));
+            D = std::max(D_prior * 0.5f, std::min(D, D_prior * 2.0f));
+        }
+        else if((int)vObjectPts.size() >= MIN_OBJECT_POINTS) {
+            const int nPts = (int)vObjectPts.size();
+            std::vector<Eigen::Vector3f> vPlanePts(nPts);
+            for(int i = 0; i < nPts; i++)
+                vPlanePts[i] = vObjectPts[i] - n_w * (n_w.dot(vObjectPts[i]) - d_ref);
+
+            std::vector<float> coordX(nPts), coordY(nPts), coordZ(nPts);
+            for(int i = 0; i < nPts; i++) {
+                coordX[i] = vPlanePts[i].x();
+                coordY[i] = vPlanePts[i].y();
+                coordZ[i] = vPlanePts[i].z();
+            }
+            std::sort(coordX.begin(), coordX.end());
+            std::sort(coordY.begin(), coordY.end());
+            std::sort(coordZ.begin(), coordZ.end());
+            P_ctr = Eigen::Vector3f(coordX[nPts/2], coordY[nPts/2], coordZ[nPts/2]);
+            P_ctr -= n_w * (n_w.dot(P_ctr) - d_ref);
+
+            Eigen::Vector3f V_dir = P_ctr - mCurrentFrame.GetCameraCenter();
+            V_dir -= n_w * n_w.dot(V_dir);
+            const float Vn = V_dir.norm();
+            if(Vn < 1e-6f) { mvDetection3Ds.push_back(det3d); continue; }
+            V_dir /= Vn;
+            Eigen::Vector3f U_dir = n_w.cross(V_dir).normalized();
+
+            std::vector<float> vU(nPts), vV(nPts);
+            for(int i = 0; i < nPts; i++) {
+                Eigen::Vector3f rel = vPlanePts[i] - P_ctr;
+                vU[i] = rel.dot(U_dir);
+                vV[i] = rel.dot(V_dir);
+            }
+            std::sort(vU.begin(), vU.end());
+            std::sort(vV.begin(), vV.end());
+            const int iLo = std::max(0, (int)(nPts * 0.05f));
+            const int iHi = std::min(nPts - 1, (int)(nPts * 0.95f));
+            float spreadU = std::max(vU[iHi] - vU[iLo], 0.005f);
+            float spreadV = std::max(vV[iHi] - vV[iLo], 0.005f);
+
+            const float alpha = std::min(1.0f, (float)nPts / 20.0f);
+            W = alpha * spreadU + (1.0f - alpha) * W_prior;
+            D = alpha * spreadV + (1.0f - alpha) * D_prior;
+            W = std::max(W_prior * 0.2f, std::min(W, W_prior * 3.0f));
+            D = std::max(D_prior * 0.2f, std::min(D, D_prior * 3.0f));
+        }
+        else {
+            // 既无有效地面反投影、框内点也不足 → 不建框
             mvDetection3Ds.push_back(det3d);
             continue;
         }
 
-        // ===== 步骤2: 位置估计 - 中位数投影到平面 =====
-        int nPts = (int)vObjectPts.size();
-
-        // 将点投影到平面上（去除高度分量）
-        std::vector<Eigen::Vector3f> vPlanePts(nPts);
-        for(int i = 0; i < nPts; i++)
-            vPlanePts[i] = vObjectPts[i] - n_w * (n_w.dot(vObjectPts[i]) - d_ref);
-
-        // 中位数抗离群
-        std::vector<float> coordX(nPts), coordY(nPts), coordZ(nPts);
-        for(int i = 0; i < nPts; i++) {
-            coordX[i] = vPlanePts[i].x();
-            coordY[i] = vPlanePts[i].y();
-            coordZ[i] = vPlanePts[i].z();
-        }
-        std::sort(coordX.begin(), coordX.end());
-        std::sort(coordY.begin(), coordY.end());
-        std::sort(coordZ.begin(), coordZ.end());
-        Eigen::Vector3f P_ctr(coordX[nPts/2], coordY[nPts/2], coordZ[nPts/2]);
-        // 确保精确在平面上
-        P_ctr -= n_w * (n_w.dot(P_ctr) - d_ref);
-
-        // ===== 步骤3: 尺寸估计 - 特征点分布 + 先验融合 =====
-        // 平面局部坐标系
-        Eigen::Vector3f V_dir = P_ctr - mCurrentFrame.GetCameraCenter();
-        V_dir -= n_w * n_w.dot(V_dir);
-        float Vn = V_dir.norm();
-        if(Vn < 1e-6f) { mvDetection3Ds.push_back(det3d); continue; }
-        V_dir /= Vn;
-        Eigen::Vector3f U_dir = n_w.cross(V_dir).normalized();
-
-        // 计算各点在局部坐标系下的分布
-        std::vector<float> vU(nPts), vV(nPts);
-        for(int i = 0; i < nPts; i++) {
-            Eigen::Vector3f rel = vPlanePts[i] - P_ctr;
-            vU[i] = rel.dot(U_dir);
-            vV[i] = rel.dot(V_dir);
-        }
-        std::sort(vU.begin(), vU.end());
-        std::sort(vV.begin(), vV.end());
-
-        // 5%~95% 百分位范围（去除离群点）
-        int iLo = std::max(0, (int)(nPts * 0.05f));
-        int iHi = std::min(nPts - 1, (int)(nPts * 0.95f));
-        float spreadU = vU[iHi] - vU[iLo];
-        float spreadV = vV[iHi] - vV[iLo];
-        // 确保最小尺寸
-        spreadU = std::max(spreadU, 0.005f);
-        spreadV = std::max(spreadV, 0.005f);
-
-        // 高度中位数
-        std::sort(vHeights.begin(), vHeights.end());
-        float medHeight = vHeights[nPts / 2];
-
-        // 先验尺寸 (SLAM单位)
-        float W_prior = classW_m[ci] * scaleToSlam;
-        float D_prior = classD_m[ci] * scaleToSlam;
-        float H_prior = classH_m[ci] * scaleToSlam;
-
-        // 融合权重: 点越多越信任特征点分布
-        float alpha = std::min(1.0f, (float)nPts / 20.0f);
-        float W = alpha * spreadU + (1.0f - alpha) * W_prior;
-        float D = alpha * spreadV + (1.0f - alpha) * D_prior;
-        float H = alpha * medHeight + (1.0f - alpha) * H_prior;
-
-        // 尺寸合理性约束
-        W = std::max(W_prior * 0.2f, std::min(W, W_prior * 3.0f));
-        D = std::max(D_prior * 0.2f, std::min(D, D_prior * 3.0f));
+        // 高度合理性约束
         H = std::max(H_prior * 0.2f, std::min(H, slamHeight * MAX_HEIGHT_RATIO));
 
-        det3d.center = P_ctr;
-        det3d.width  = W;
-        det3d.depth  = D;
-        det3d.height = H;
-        det3d.bValid = true;
+        det3d.center  = P_ctr;
+        det3d.width   = W;
+        det3d.depth   = D;
+        det3d.height  = H;
+        det3d.heading = heading;   // 地面反投影给出朝向；回退路径为 0
+        det3d.confidence = det.conf;   // 融合加权用
+        det3d.bValid  = true;
         mvDetection3Ds.push_back(det3d);
 
         // ===== 步骤4: 加入持久地图（去重+数量配额） =====
@@ -6205,7 +6867,7 @@ void Tracking::Lift2DBoxesTo3D()
             f << mCurrentFrame.mnId << " " << det3d.class_id << " "
               << det3d.center.x() << " " << det3d.center.y() << " " << det3d.center.z() << " "
               << W << " " << D << " " << H
-              << " " << nPts << " 1\n";
+              << " " << nPtsLog << " 1\n";
     }
     if(f.is_open()) f.close();
 
@@ -6243,54 +6905,538 @@ void Tracking::Lift2DBoxesTo3D()
         }
     }
 
-    // ===== RANSAC 直线对齐: 同类目标倾向排列（停车场/马路边缘） =====
+}
+
+/**
+ * 长短焦模式：2D检测框 → 3D框。
+ * 与单目实现的区别：
+ *  - 必须"左右目都观测到"才生成：检测框在左目匹配到右目（mvMatchedRightBoxIdx>=0），
+ *    且框内至少有 MIN_STEREO_POINTS 个左右目立体匹配特征点；
+ *  - 3D 点来自两类特征：左右目立体匹配特征点（mvDepth>0，真实视差深度）
+ *    与前后帧匹配特征点（被跟踪的地图点）；
+ *  - 输出约定与单目一致：底面中心投影到地面平面，width/depth 沿平面方向，
+ *    height 为特征点相对平面高度的中位数，供现有绘制/持久化/PLY 复用。
+ */
+void Tracking::Lift2DBoxesTo3D_Stereo()
+{
+    Map* pMap = mpAtlas->GetCurrentMap();
+    if(!pMap || !pMap->IsPlaneEstimated()) return;
+
+    // ===== 频率控制: 每10帧执行一次（放宽自30帧，让3D框更快出现/更新） =====
+    if(mCurrentFrame.mnId - mnLastLift3DFrameId < 10)
+        return;
+    mnLastLift3DFrameId = mCurrentFrame.mnId;
+
+    const Eigen::Vector3f& n_w = pMap->GetPlaneNormal();
+    float d_ref = pMap->GetPlaneRefOffset();
+    float slamHeight = pMap->GetPlaneRefHeight();
+    if(std::abs(d_ref) < 1e-6f || slamHeight < 0.01f) return;
+
+    const float HEIGHT = 50.0f;
+    float scaleToSlam = slamHeight / HEIGHT;
+
+    // 类别默认尺寸 (物理米), 通过 scaleToSlam 转为 SLAM 单位
+    // 统一先验表见 common.h（CLASS_WIDTH_M / CLASS_LENGTH_M / CLASS_HEIGHT_M）
+    // class_id: 0=pedestrian,1=people,2=bicycle,3=car,4=van,5=truck,6=tricycle,7=awning,8=bus,9=motor
+    const float* classW_m = CLASS_WIDTH_M.data();
+    const float* classD_m = CLASS_LENGTH_M.data();
+    const float* classH_m = CLASS_HEIGHT_M.data();
+
+    // 生成门槛（2026-08-13 收紧，用户反馈：无目标位置误生成、尺寸异常）：
+    //  - MIN_DET_CONF：2D 检测置信度门槛（检测器 NMS 阈值 0.5，低置信度多为误检）；
+    //  - MIN_STEREO_POINTS 1→2 / MIN_OBJECT_POINTS 2→4：点太少无法支撑可靠 3D 框；
+    //  - MAX_DEPTH_SPREAD：框内点相机深度跨度比≤2（前/背景混入时跨度明显偏大）；
+    //  - MAX_POINT_SPREAD_RATIO：3D 分布跨度不得超过类别先验该倍数（防多目标混入）；
+    //  - 3D 中心投影回图像需落在 2D 框附近（防止抓到邻域目标/背景）。
+    const float MIN_DET_CONF = 0.55f;
+    const int   MIN_OBJECT_POINTS = 3;
+    const int   MIN_STEREO_POINTS = 2;
+    const float MAX_DEPTH_SPREAD = 2.0f;
+    const float MAX_POINT_SPREAD_RATIO = 2.5f;
+    const float MAX_HEIGHT_RATIO = 0.6f;
+    const float MIN_HEIGHT_CAP = 2.0f;   // 高度上限下限（SLAM单位）
+
+    // ===== 预统计: 每类2D检测数量 与 当前视野内持久3D框数量 =====
+    int nDet2D[10] = {0};
+    for(const auto& det : mCurrentFrame.detectedBoxes) {
+        if(det.class_id < 2 || det.class_id > 9 || det.is_dynamic) continue;
+        if(det.bbox.width < 4 || det.bbox.height < 4) continue;
+        if(det.conf < MIN_DET_CONF) continue;   // 与 Pass1 门槛一致：低置信度不占配额
+        nDet2D[det.class_id]++;
+    }
+
+    const float fx = mCurrentFrame.fx, fy = mCurrentFrame.fy;
+    const float cx = mCurrentFrame.cx, cy = mCurrentFrame.cy;
+    const Sophus::SE3f Tcw = mCurrentFrame.GetPose();
+    auto isInFOV = [&](const Eigen::Vector3f& Pw) -> bool {
+        Eigen::Vector3f Pc = Tcw * Pw;
+        if(Pc.z() < 0.05f) return false;
+        float u = fx * Pc.x() / Pc.z() + cx;
+        float v = fy * Pc.y() / Pc.z() + cy;
+        return u >= mCurrentFrame.mnMinX && u < mCurrentFrame.mnMaxX &&
+               v >= mCurrentFrame.mnMinY && v < mCurrentFrame.mnMaxY;
+    };
+
+    int nBox3D[10] = {0};
+    bool bAllFrozen[10];
+    std::fill(bAllFrozen, bAllFrozen + 10, true);
+    for(const auto& b : pMap->GetPersistentBoxes()) {
+        if(b.class_id < 2 || b.class_id > 9) continue;
+        if(!isInFOV(b.center)) continue;
+        nBox3D[b.class_id]++;
+        if(!b.bFrozen) bAllFrozen[b.class_id] = false;
+    }
+
+    mvDetection3Ds.clear();
+    mvDetection3Ds.resize(mCurrentFrame.detectedBoxes.size());
+    for(auto& d3 : mvDetection3Ds) { d3.bValid = false; d3.nObservations = 0; }
+
+    // 平面内基（列方向估计/尺寸分解用）
+    Eigen::Vector3f ref2 = (std::abs(n_w.x()) < 0.9f) ? Eigen::Vector3f::UnitX() : Eigen::Vector3f::UnitZ();
+    Eigen::Vector3f e1 = n_w.cross(ref2).normalized();
+    Eigen::Vector3f e2 = n_w.cross(e1).normalized();
+
+    // ===== 候选结构：Pass1 收集点/中心/框内主轴，Pass2 用全局朝向定轴定尺寸 =====
+    struct StereoCand {
+        int class_id;
+        bool bAllowNew;
+        bool bDynamic;                   // 动态目标：生成临时3D框用于反误建，不持久化
+        size_t di;                       // detectedBoxes 索引（结果回填用）
+        Eigen::Vector3f P_ctr;           // 平面投影中心
+        Eigen::Vector3f perBoxHeading;   // 框内点主轴（平面内单位向量，无效为零）
+        std::vector<Eigen::Vector3f> vPlanePts;
+        std::vector<float> vHeights;
+        int nStereoPts;
+    };
+    std::vector<StereoCand> vCands;
+    vCands.reserve(mCurrentFrame.detectedBoxes.size());
+
+    // ===== Pass 1: 收集框内3D点、中心、框内主轴 =====
+    for(size_t di = 0; di < mCurrentFrame.detectedBoxes.size(); di++)
     {
-        std::vector<Detection3D> boxes = pMap->GetPersistentBoxes();
-        int nSnapped = 0;
+        const Detection& det = mCurrentFrame.detectedBoxes[di];
+        // 跳过人类(0=pedestrian, 1=people)。
+        // 注意：动态目标不跳过——生成临时3D框，用于删除与它高重叠的持久框
+        // （动态目标漏检/被误判为静态时会产生错误持久框，这里在识别到动态后清除）。
+        if(det.class_id <= 1) continue;
+        if(det.bbox.width < 4 || det.bbox.height < 4) continue;
+        if(det.conf < MIN_DET_CONF) continue;   // 低置信度检测多为误检，不建3D框
+        // 左右目都观测到才生成：左目检测框必须匹配到右目
+        if(di >= mCurrentFrame.mvMatchedRightBoxIdx.size() ||
+           mCurrentFrame.mvMatchedRightBoxIdx[di] < 0) continue;
 
-        Eigen::Vector3f ref2 = (std::abs(n_w.x()) < 0.9f) ? Eigen::Vector3f::UnitX() : Eigen::Vector3f::UnitZ();
-        Eigen::Vector3f e1 = n_w.cross(ref2).normalized();
-        Eigen::Vector3f e2 = n_w.cross(e1).normalized();
+        const float bx = det.bbox.x, by = det.bbox.y;
+        const float bw = det.bbox.width, bh = det.bbox.height;
+        const int ci = (det.class_id >= 0 && det.class_id <= 9) ? det.class_id : 0;
 
-        for(int cid = 3; cid <= 8; cid++) {
-            vector<int> indices;
-            for(size_t i = 0; i < boxes.size(); i++)
-                if(boxes[i].class_id == cid && boxes[i].bValid) indices.push_back((int)i);
-            if(indices.size() < 3) continue;
+        // 数量门控: 视野内该类3D框已达2D检测数量且全部冻结 → 跳过计算
+        if(nBox3D[ci] >= nDet2D[ci] && bAllFrozen[ci]) continue;
+        const bool bAllowNew = nBox3D[ci] < nDet2D[ci];
 
-            struct P { float u,v; };
-            vector<P> pts(indices.size());
-            for(size_t k = 0; k < indices.size(); k++) {
-                Eigen::Vector3f p = boxes[indices[k]].center;
-                pts[k] = {e1.dot(p), e2.dot(p)};
+        // 收集框内3D特征点：a) 左右目立体匹配点（真实视差深度） b) 前后帧匹配点（地图点）
+        std::vector<Eigen::Vector3f> vObjectPts;
+        std::vector<float> vHeights;
+        vObjectPts.reserve(32);
+        vHeights.reserve(32);
+        int nStereoPts = 0;
+        for(int i = 0; i < mCurrentFrame.N; i++)
+        {
+            const cv::KeyPoint& kp = mCurrentFrame.mvKeys[i];   // 校正坐标（与检测框一致）
+            if(kp.pt.x < bx || kp.pt.x > bx + bw ||
+               kp.pt.y < by || kp.pt.y > by + bh)
+                continue;
+
+            Eigen::Vector3f Pw;
+            bool bHasPw = false;
+            const float z = mCurrentFrame.mvDepth[i];
+            if(z > 0.f)
+            {
+                // 左右目立体匹配点：相机系 -> 世界。
+                // 视差深度是"真实米"，地图/平面/先验是 SLAM 单位（尺度可能被压缩），
+                // 先把相机系偏移按 scaleToSlam 缩放到 SLAM 单位再叠加到相机位置。
+                Eigen::Vector3f Pc((kp.pt.x - cx) * z * mCurrentFrame.invfx,
+                                   (kp.pt.y - cy) * z * mCurrentFrame.invfy,
+                                   z);
+                Pw = mCurrentFrame.GetRwc() * (Pc * scaleToSlam) + mCurrentFrame.GetCameraCenter();
+                nStereoPts++;
+                bHasPw = true;
             }
-
-            float bestR=0, bestA=0, bestB=0, bestC=0; int bestN=0;
-            const float th = 0.06f;
-            for(int t=0; t<std::min(30,(int)indices.size()*5); t++) {
-                int i1=std::rand()%indices.size(), i2=std::rand()%indices.size();
-                if(i1==i2) continue;
-                float dx=pts[i2].u-pts[i1].u, dy=pts[i2].v-pts[i1].v, L=std::sqrt(dx*dx+dy*dy);
-                if(L<0.005f) continue;
-                float a=-dy/L, b=dx/L, c=-(a*pts[i1].u+b*pts[i1].v);
-                int in=0; for(auto& p:pts) if(std::abs(a*p.u+b*p.v+c)<th) in++;
-                float r=(float)in/indices.size();
-                if(r>bestR) { bestR=r; bestA=a; bestB=b; bestC=c; bestN=in; }
+            else if(mCurrentFrame.mvpMapPoints[i] &&
+                    !mCurrentFrame.mvpMapPoints[i]->isBad() &&
+                    mCurrentFrame.mvpMapPoints[i]->mFeatureStatus != MapPoint::DYNAMIC)
+            {
+                Pw = mCurrentFrame.mvpMapPoints[i]->GetWorldPos();
+                bHasPw = true;
             }
-            if(bestR<0.6f || bestN<3) continue;
+            if(!bHasPw) continue;
 
-            // 仅对齐未冻结的框
-            for(size_t k=0; k<indices.size(); k++) {
-                int idx=indices[k];
-                if(boxes[idx].bFrozen) continue;  // 冻结框不参与对齐
-                float d=bestA*pts[k].u+bestB*pts[k].v+bestC;
-                float su=pts[k].u-bestA*d*0.3f, sv=pts[k].v-bestB*d*0.3f;
-                boxes[idx].center += e1*(su-pts[k].u) + e2*(sv-pts[k].v);
-                boxes[idx].center -= n_w * (n_w.dot(boxes[idx].center) - d_ref);
-                nSnapped++;
+            const float height = n_w.dot(Pw) - d_ref;
+            const float heightCap = std::max(slamHeight * MAX_HEIGHT_RATIO, MIN_HEIGHT_CAP);
+            if(height > -0.5f && height < heightCap)
+            {
+                vObjectPts.push_back(Pw);
+                vHeights.push_back(height);
             }
         }
-        if(nSnapped>0) pMap->ReplacePersistentBoxes(boxes);
+
+        if(nStereoPts < MIN_STEREO_POINTS || (int)vObjectPts.size() < MIN_OBJECT_POINTS)
+            continue;
+
+        // 深度一致性：框内点相机深度跨度比≤MAX_DEPTH_SPREAD。
+        // 真实目标（车）的框内点深度集中；混入前景/背景/邻域目标时跨度明显偏大。
+        {
+            float zMin = 1e9f, zMax = 0.f;
+            for(const auto& p : vObjectPts)
+            {
+                const float zc = (Tcw * p).z();
+                zMin = std::min(zMin, zc);
+                zMax = std::max(zMax, zc);
+            }
+            if(zMin <= 0.05f || zMax / zMin > MAX_DEPTH_SPREAD)
+                continue;
+        }
+
+        // 中心：中位数投影到平面
+        const int nPts = (int)vObjectPts.size();
+        std::vector<Eigen::Vector3f> vPlanePts(nPts);
+        for(int i = 0; i < nPts; i++)
+            vPlanePts[i] = vObjectPts[i] - n_w * (n_w.dot(vObjectPts[i]) - d_ref);
+
+        std::vector<float> coordX(nPts), coordY(nPts), coordZ(nPts);
+        for(int i = 0; i < nPts; i++) {
+            coordX[i] = vPlanePts[i].x();
+            coordY[i] = vPlanePts[i].y();
+            coordZ[i] = vPlanePts[i].z();
+        }
+        std::sort(coordX.begin(), coordX.end());
+        std::sort(coordY.begin(), coordY.end());
+        std::sort(coordZ.begin(), coordZ.end());
+        Eigen::Vector3f P_ctr(coordX[nPts/2], coordY[nPts/2], coordZ[nPts/2]);
+        P_ctr -= n_w * (n_w.dot(P_ctr) - d_ref);
+
+        // 3D中心投影回图像须落在2D框附近（±0.5倍框尺寸余量）：
+        // 框内点来自邻域目标/背景时，3D中心会明显偏离检测框。
+        {
+            const Eigen::Vector3f Pc = Tcw * P_ctr;
+            if(Pc.z() < 0.05f) continue;
+            const float u = fx * Pc.x() / Pc.z() + cx;
+            const float v = fy * Pc.y() / Pc.z() + cy;
+            if(u < bx - 0.5f*bw || u > bx + 1.5f*bw ||
+               v < by - 0.5f*bh || v > by + 1.5f*bh)
+                continue;
+        }
+
+        // 框内点主轴（平面内）：2点用连线方向，≥3点用2D PCA（伸长比≥1.5才信）
+        Eigen::Vector3f perBoxHeading = Eigen::Vector3f::Zero();
+        if(nPts == 2)
+        {
+            perBoxHeading = vPlanePts[1] - vPlanePts[0];
+            perBoxHeading -= n_w * n_w.dot(perBoxHeading);
+            const float hn = perBoxHeading.norm();
+            if(hn > 1e-6f) perBoxHeading /= hn;
+        }
+        else
+        {
+            Eigen::Vector2f mean2(0.f, 0.f);
+            for(int i = 0; i < nPts; i++)
+                mean2 += Eigen::Vector2f(e1.dot(vPlanePts[i]), e2.dot(vPlanePts[i]));
+            mean2 /= (float)nPts;
+            float cxx = 0.f, cyy = 0.f, cxy = 0.f;
+            for(int i = 0; i < nPts; i++)
+            {
+                const float dx = e1.dot(vPlanePts[i]) - mean2.x();
+                const float dy = e2.dot(vPlanePts[i]) - mean2.y();
+                cxx += dx*dx; cyy += dy*dy; cxy += dx*dy;
+            }
+            const float tr2 = (cxx + cyy) * 0.5f;
+            const float dlt = std::sqrt(std::max(0.f, (cxx - cyy)*0.5f*(cxx - cyy)*0.5f + cxy*cxy));
+            const float l1 = tr2 + dlt, l2 = std::max(0.f, tr2 - dlt);
+            if(l2 > 1e-6f && l1 >= 1.5f * l2)
+            {
+                Eigen::Vector2f dir(cxy, l1 - cxx);
+                if(dir.norm() > 1e-6f) dir.normalize();
+                perBoxHeading = (e1 * dir.x() + e2 * dir.y()).normalized();
+            }
+        }
+
+        vCands.push_back({ci, bAllowNew, det.is_dynamic, di, P_ctr, perBoxHeading,
+                          std::move(vPlanePts), std::move(vHeights), nStereoPts});
+    }
+
+    // ===== 全局朝向：同类目标倾向排成一列，用同类中心拟合列方向 =====
+    // 每类：本帧候选中心 + 视野内持久框中心 → 平面内2D PCA；
+    // 伸长比≥2 视为可靠列方向（成列车辆朝向一致）。
+    std::map<int, Eigen::Vector3f> mapClassHeading;
+    {
+        for(int cid = 2; cid <= 9; cid++)
+        {
+            std::vector<Eigen::Vector2f> vC;
+            for(const auto& c : vCands)
+                if(c.class_id == cid) vC.emplace_back(e1.dot(c.P_ctr), e2.dot(c.P_ctr));
+            for(const auto& b : pMap->GetPersistentBoxes())
+                if(b.class_id == cid && b.bValid && isInFOV(b.center))
+                    vC.emplace_back(e1.dot(b.center), e2.dot(b.center));
+            if(vC.size() < 3) continue;
+
+            Eigen::Vector2f mean2(0.f, 0.f);
+            for(const auto& p : vC) mean2 += p;
+            mean2 /= (float)vC.size();
+            float cxx = 0.f, cyy = 0.f, cxy = 0.f;
+            for(const auto& p : vC)
+            {
+                const float dx = p.x() - mean2.x(), dy = p.y() - mean2.y();
+                cxx += dx*dx; cyy += dy*dy; cxy += dx*dy;
+            }
+            const float tr2 = (cxx + cyy) * 0.5f;
+            const float dlt = std::sqrt(std::max(0.f, (cxx - cyy)*0.5f*(cxx - cyy)*0.5f + cxy*cxy));
+            const float l1 = tr2 + dlt, l2 = std::max(0.f, tr2 - dlt);
+            if(l2 <= 1e-6f || l1 < 2.0f * l2) continue;   // 点列不伸长，不成列
+            Eigen::Vector2f dir(cxy, l1 - cxx);
+            if(dir.norm() < 1e-6f) continue;
+            dir.normalize();
+            mapClassHeading[cid] = (e1 * dir.x() + e2 * dir.y()).normalized();
+        }
+    }
+
+    std::vector<Eigen::Vector3f> vLoggedCentersThisFrame;   // 同帧内已记录过的3D框中心（去重日志）
+
+    // ===== 同类尺寸参考：同一运行中同类别目标体型应相似 =====
+    // 取地图内同类持久框的宽度/深度中位数作为类别参考尺寸；
+    // 样本≥2时，新框向参考尺寸融合并硬约束在 [0.5×, 2×] 内，防止个别巨大/过小框。
+    std::map<int, std::pair<float, float> > mapClassSize;   // cid -> (W_ref, D_ref)
+    {
+        const std::vector<Detection3D>& vPersist = pMap->GetPersistentBoxes();
+        for(int cid = 2; cid <= 9; cid++)
+        {
+            std::vector<float> vW, vD;
+            for(const auto& b : vPersist)
+            {
+                if(b.class_id != cid || !b.bValid) continue;
+                if(b.width <= 0.f || b.depth <= 0.f) continue;
+                vW.push_back(b.width);
+                vD.push_back(b.depth);
+            }
+            if((int)vW.size() < 2) continue;
+            std::sort(vW.begin(), vW.end());
+            std::sort(vD.begin(), vD.end());
+            mapClassSize[cid] = {vW[vW.size() / 2], vD[vD.size() / 2]};
+        }
+    }
+
+    // 保存文件
+    static std::string saveFile = "Detection3D.txt";
+    static bool fileInitialized = false;
+    std::ofstream f;
+    if(!fileInitialized) {
+        f.open(saveFile);
+        f << "# frame_id class_id cx cy cz width depth height nObjPts nStereoPts\n";
+        fileInitialized = true;
+    } else {
+        f.open(saveFile, std::ios::app);
+    }
+
+    // 动态目标临时3D框（用于反误建删除，不持久化）
+    std::vector<Detection3D> vDynamicBoxes;
+
+    // ===== Pass 2: 用朝向定轴定尺寸 + 持久化 + 日志 =====
+    for(auto& c : vCands)
+    {
+        const int ci = c.class_id;
+        Detection3D& det3d = mvDetection3Ds[c.di];
+        det3d.class_id = ci;
+
+        // 长度轴（深度D = 车长方向）优先级：
+        //   1) 同类列方向（成列车辆朝向一致，用户需求）
+        //   2) 框内点主轴
+        //   3) 相机径向（原行为兜底，仅当框内点过少/分布无方向性时）
+        Eigen::Vector3f L_dir;
+        auto itH = mapClassHeading.find(ci);
+        if(itH != mapClassHeading.end() && itH->second.squaredNorm() > 0.5f)
+            L_dir = itH->second;
+        else if(c.perBoxHeading.squaredNorm() > 0.5f)
+            L_dir = c.perBoxHeading;
+        else
+        {
+            L_dir = c.P_ctr - mCurrentFrame.GetCameraCenter();
+            L_dir -= n_w * n_w.dot(L_dir);
+            const float ln = L_dir.norm();
+            if(ln < 1e-6f) continue;
+            L_dir /= ln;
+        }
+        const Eigen::Vector3f W_dir = n_w.cross(L_dir).normalized();   // 车宽方向
+
+        // 沿长度/宽度方向的5-95%分布跨度
+        const int nPts = (int)c.vPlanePts.size();
+        std::vector<float> vL(nPts), vW(nPts);
+        for(int i = 0; i < nPts; i++)
+        {
+            const Eigen::Vector3f rel = c.vPlanePts[i] - c.P_ctr;
+            vL[i] = rel.dot(L_dir);
+            vW[i] = rel.dot(W_dir);
+        }
+        std::sort(vL.begin(), vL.end());
+        std::sort(vW.begin(), vW.end());
+        const int iLo = std::max(0, (int)(nPts * 0.05f));
+        const int iHi = std::min(nPts - 1, (int)(nPts * 0.95f));
+        const float spreadL = std::max(vL[iHi] - vL[iLo], 0.005f);
+        const float spreadW = std::max(vW[iHi] - vW[iLo], 0.005f);
+
+        std::vector<float> vHeightsSorted = c.vHeights;
+        std::sort(vHeightsSorted.begin(), vHeightsSorted.end());
+        const float medHeight = vHeightsSorted[nPts / 2];
+
+        const float W_prior = classW_m[ci] * scaleToSlam;   // 车宽先验（物理米）
+        const float D_prior = classD_m[ci] * scaleToSlam;   // 车长先验（物理米）
+        const float H_prior = classH_m[ci] * scaleToSlam;
+
+        // 3D分布跨度不得超过类别先验的 MAX_POINT_SPREAD_RATIO 倍：
+        // 跨度远大于类别尺寸说明框内混入邻域目标/背景，直接拒绝
+        if(spreadL > MAX_POINT_SPREAD_RATIO * D_prior ||
+           spreadW > MAX_POINT_SPREAD_RATIO * W_prior)
+            continue;
+
+        const float alpha = std::min(1.0f, (float)nPts / 10.0f);
+        float W = alpha * spreadW + (1.0f - alpha) * W_prior;   // 车宽（垂直于朝向）
+        float D = alpha * spreadL + (1.0f - alpha) * D_prior;   // 车长（沿朝向）
+        float H = alpha * medHeight + (1.0f - alpha) * H_prior;
+
+        // 同类尺寸一致性：有类别参考时向参考融合（框内点少更信参考），并硬约束范围
+        auto itS = mapClassSize.find(ci);
+        if(itS != mapClassSize.end())
+        {
+            const float W_ref = itS->second.first;
+            const float D_ref = itS->second.second;
+            const float wRef = 0.5f + 0.35f * alpha;   // 0.5~0.85：点越多越信实测
+            W = wRef * W + (1.0f - wRef) * W_ref;
+            D = wRef * D + (1.0f - wRef) * D_ref;
+            W = std::max(0.5f * W_ref, std::min(W, 2.0f * W_ref));
+            D = std::max(0.5f * D_ref, std::min(D, 2.0f * D_ref));
+        }
+
+        // 最终夹紧收紧：实测尺寸偏离先验超过 [0.5×, 2×] 视为不可信
+        W = std::max(W_prior * 0.5f, std::min(W, W_prior * 2.0f));
+        D = std::max(D_prior * 0.5f, std::min(D, D_prior * 2.0f));
+        // 高度合理性：超出类别先验 2 倍视为异常（混合尺度/离群点），强约束回先验附近
+        H = std::min(H, H_prior * 2.0f);
+        H = std::max(H_prior * 0.2f, std::min(H, std::max(slamHeight * MAX_HEIGHT_RATIO, MIN_HEIGHT_CAP)));
+
+        det3d.center  = c.P_ctr;
+        det3d.width   = W;
+        det3d.depth   = D;
+        det3d.height  = H;
+        det3d.heading = L_dir;   // 车长轴方向（平面内单位向量）
+        det3d.confidence = (c.di < mCurrentFrame.detectedBoxes.size())
+                           ? mCurrentFrame.detectedBoxes[c.di].conf : 0.f;
+        det3d.bValid  = true;
+
+        // 动态目标：只用于反误建，不持久化、不写日志
+        if(c.bDynamic)
+        {
+            vDynamicBoxes.push_back(det3d);
+            continue;
+        }
+
+        // 加入持久地图（去重+数量配额；合并时朝向按模π一致后平均）
+        if(pMap->AddOrUpdateDetection3D(det3d, c.bAllowNew)) {
+            nBox3D[ci]++;
+            bAllFrozen[ci] = false;
+        }
+
+        // 同一目标可能被检测出多个近重合的 2D 框（NMS 未合并），会生成中心几乎
+        // 相同的 3D 框；同一帧只记录第一条，避免 Detection3D.txt 出现重复行。
+        {
+            bool bAlreadyLogged = false;
+            for(const Eigen::Vector3f& cc : vLoggedCentersThisFrame)
+            {
+                if((cc - det3d.center).norm() < 0.5f)
+                {
+                    bAlreadyLogged = true;
+                    break;
+                }
+            }
+            if(!bAlreadyLogged)
+            {
+                vLoggedCentersThisFrame.push_back(det3d.center);
+                if(f.is_open())
+                    f << mCurrentFrame.mnId << " " << det3d.class_id << " "
+                      << det3d.center.x() << " " << det3d.center.y() << " " << det3d.center.z() << " "
+                      << W << " " << D << " " << H
+                      << " " << nPts << " " << c.nStereoPts << "\n";
+            }
+        }
+    }
+    if(f.is_open()) f.close();
+
+    // ===== 动态目标反误建：删除与动态框高重叠的持久框 =====
+    // 场景：动态目标（行驶车辆）在某些帧漏检/被误判为静态，生成了错误的持久3D框；
+    // 一旦后续帧把它识别为动态，就用其3D框把重叠的持久框清掉。
+    if(!vDynamicBoxes.empty())
+    {
+        std::vector<Detection3D> boxes = pMap->GetPersistentBoxes();
+        bool bChanged = false;
+        for(auto& db : vDynamicBoxes)
+        {
+            if(!db.bValid) continue;
+            const Eigen::Vector3f ua = n_w.cross(db.heading).normalized();   // 动态框宽向
+            const Eigen::Vector3f va = db.heading.normalized();              // 动态框长向
+            for(auto& pb : boxes)
+            {
+                if(!pb.bValid) continue;   // 冻结框同样清除：漏检期间可能已被误冻结
+                const Eigen::Vector3f rel = pb.center - db.center;
+                const float du = std::abs(rel.dot(ua));
+                const float dv = std::abs(rel.dot(va));
+                const float ow = std::max(0.f, 0.5f * (db.width + pb.width) - du);
+                const float od = std::max(0.f, 0.5f * (db.depth + pb.depth) - dv);
+                const float area = ow * od;
+                const float minArea = std::min(db.width * db.depth, pb.width * pb.depth);
+                if(minArea <= 0.f) continue;
+                if(area / minArea > 0.4f)   // 重叠占较小框 >40% → 判定为同一目标
+                {
+                    pb.bValid = false;
+                    bChanged = true;
+                }
+            }
+        }
+        if(bChanged)
+        {
+            std::vector<Detection3D> vKept;
+            vKept.reserve(boxes.size());
+            for(const auto& b : boxes)
+                if(b.bValid) vKept.push_back(b);
+            pMap->ReplacePersistentBoxes(vKept);
+        }
+    }
+
+    // ===== 数量清理: 视野内某类3D框多于2D检测数量 → 删除多余的未冻结框 =====
+    {
+        std::vector<Detection3D> boxes = pMap->GetPersistentBoxes();
+        bool bChanged = false;
+        for(int cid = 2; cid <= 9; cid++) {
+            std::vector<int> vInFov;
+            for(size_t i = 0; i < boxes.size(); i++)
+                if(boxes[i].class_id == cid && isInFOV(boxes[i].center))
+                    vInFov.push_back((int)i);
+            int excess = (int)vInFov.size() - nDet2D[cid];
+            if(excess <= 0) continue;
+            std::vector<int> vRemovable;
+            for(int idx : vInFov)
+                if(!boxes[idx].bFrozen) vRemovable.push_back(idx);
+            std::sort(vRemovable.begin(), vRemovable.end(), [&boxes](int a, int b){
+                return boxes[a].nObservations < boxes[b].nObservations;
+            });
+            int nDel = std::min(excess, (int)vRemovable.size());
+            for(int k = 0; k < nDel; k++) {
+                boxes[vRemovable[k]].bValid = false;
+                bChanged = true;
+            }
+        }
+        if(bChanged) {
+            std::vector<Detection3D> vKept;
+            vKept.reserve(boxes.size());
+            for(const auto& b : boxes)
+                if(b.bValid) vKept.push_back(b);
+            pMap->ReplacePersistentBoxes(vKept);
+        }
     }
 }
 
@@ -6340,17 +7486,21 @@ void Tracking::DetectDynamicPoints()
 
     if(mpDetector) 
     {
-        mpDetector->objects = mCurrentFrame.detectedBoxes;
+        // 只回传语义字段（is_dynamic / moving_prob），不要覆盖坐标：
+        // detectedBoxes 在长短焦模式下是"校正后"坐标，若整体写回 objects，
+        // 绘制检测框时会画在校正坐标上，导致框整体向图像边缘偏移
+        // （跟踪失败时本函数不执行，objects 保持原始坐标，所以"失败时正常"）。
+        const size_t n = std::min(mCurrentFrame.detectedBoxes.size(), mpDetector->objects.size());
+        for(size_t i = 0; i < n; i++)
+        {
+            mpDetector->objects[i].is_dynamic  = mCurrentFrame.detectedBoxes[i].is_dynamic;
+            mpDetector->objects[i].moving_prob = mCurrentFrame.detectedBoxes[i].moving_prob;
+        }
     }
     
     // 步骤6：标记动态语义特征点为异常点
     MarkDynamicMapPointsAsOutliers();
 
-    // 地面平面数据收集（初始化后每帧执行，500帧后自动触发拟合）
-    CollectGroundPlaneData();
-
-    // 每30帧刷新平面点标记 + 动态偏移量更新
-    PlaneRemark();
 }
 
 /**
@@ -6373,8 +7523,6 @@ void Tracking::PlaneRemark()
     float d_ref = pMap->GetPlaneRefOffset();
     Eigen::Vector3f camCenter = mCurrentFrame.GetCameraCenter();
     vector<MapPoint*> vpAllMPs = pMap->GetAllMapPoints();
-    int nPlanePts = 0;    // 标记为平面点的数量（调试）
-    int nRatiosOut = 0;   // 本次参与λ统计的样本数（调试）
 
     // 步骤1: 从已有标记点估算当前动态偏移量 d_dynamic = median(n·P)
     {
@@ -6391,10 +7539,8 @@ void Tracking::PlaneRemark()
     float d_dynamic = pMap->GetPlaneDynamicOffset();
 
     // 步骤2: 用冻结参考平面(d_ref)重新标记平面点
-    // 阈值收窄：原 0.6×|d_ref| ≈ 60%相机高度，会把楼/树误标为平面点；
-    // 改为 5%×H_cam（尺度不变，米制下约2.5m@50m），只保留地面+车辆层。
-    const float camHeight = pMap->GetPlaneRefHeight();
-    float reMarkThreshold = std::max(0.05f * camHeight, 0.05f);
+    // 与 FitGroundPlane 一致：阈值封顶 3 个单位，避免远点/坏平面把大量点标记进平面约束
+    float reMarkThreshold = std::min(std::abs(d_ref) * 0.6f, 3.0f);
     int nNew = 0, nRemoved = 0;
     for(MapPoint* pMP : vpAllMPs) {
         if(!pMP || pMP->isBad()) continue;
@@ -6428,93 +7574,65 @@ void Tracking::PlaneRemark()
     }
     d_dynamic = pMap->GetPlaneDynamicOffset();
 
-    // 统计当前平面点数量（调试）
-    for(MapPoint* pMP : vpAllMPs) {
-        if(pMP && !pMP->isBad() && pMP->mnPlaneID >= 0) nPlanePts++;
-    }
-
     // 步骤4: 三角化高度比 → λ = median(t_triang/t_frozen)
     float lambda = pMap->GetPlaneScaleLambda();
     {
         const vector<float>& vRatios = pMap->GetTriangRatios();
         int nRatios = (int)vRatios.size();
-        nRatiosOut = nRatios;
         if(nRatios >= 10) {
             vector<float> vSorted = vRatios;
             sort(vSorted.begin(), vSorted.end());
             float medRatio = vSorted[vSorted.size() / 2];
             lambda = std::max(0.3f, std::min(1.2f, medRatio));
             pMap->SetPlaneScaleLambda(lambda);
-            mvPlaneLambdaHist.push_back(lambda);
-            if(mvPlaneLambdaHist.size() > 50) mvPlaneLambdaHist.erase(mvPlaneLambdaHist.begin());
-
-            // 步骤4.5: 全局尺度回拉——绕圆/旋转主导场景下单目尺度快速退化时，
-            // 对当前地图整体×1/λ拉回冻结平面参考尺度。
-            // 两个间隔门控：成功回拉间隔>100帧（迟滞防振荡）；
-            // 尝试间隔>90帧（失败/被跳过时不要每30帧空转重试，避免反复3秒停建图）
-            if(mSensor == System::MONOCULAR && lambda < 0.85f
-               && mCurrentFrame.mnId - mnLastScalePullbackFrameId > 100
-               && mCurrentFrame.mnId - mnLastPullbackAttemptFrameId > 90)
-            {
-                mnLastPullbackAttemptFrameId = mCurrentFrame.mnId;
-                cout << "[PlaneRemark] ★登记尺度回拉请求: λ=" << lambda
-                     << " d_ref=" << d_ref << " H_cam=" << camHeight
-                     << " 距上次回拉=" << (mCurrentFrame.mnId - mnLastScalePullbackFrameId)
-                     << " 帧" << endl;
-                // 非阻塞登记：由LocalMapping在安全点执行（ApplyScalePullback内部重置λ）
-                RequestScalePullback(lambda);
-            }
         }
         pMap->ClearTriangRatios();
     }
 
+    // 平滑过渡系数：平面创建后前 90 帧内约束强度从弱到强逐步建立，
+    // 避免平面约束突然全强度作用导致相机高度/轨迹突变
+    float ramp = 1.0f;
+    if(mnPlaneFitFrameId > 0)
+        ramp = std::min(1.0f, (float)(mCurrentFrame.mnId - mnPlaneFitFrameId) / 90.0f);
+    if(ramp <= 0.f) ramp = 0.1f;   // 刚拟合完的第一轮也不要全强度
+
     // 步骤5: 用 λ 驱动 BA 平面约束强度
     {
+        // 2026-08 修复：λ 反馈加“死区 + 限幅 + 连续确认”，打断“尺度塌缩→×5→锁死”回路。
+        // 原逻辑：λ<0.5 → boost=5，且 mfPlaneInfo = max(原值, boost*ramp) 只增不减，
+        // 绕弯一次翻转就把平面约束永久打到最大，把地图锁死在塌缩尺度
+        // （实测绕弯后尺度从 ~1.3 塌到 0.24 且无法恢复）。
+        // 现在：λ≥0.95 为死区（健康，不增强）；λ<0.7 需连续 3 轮（约90帧）确认才增强；
+        // boost 上限 2.0；每轮直接赋值而非 max 递增，λ 恢复后约束自动回落。
+        if(lambda < 0.7f)
+            mnPlaneLowLambdaStreak++;
+        else
+            mnPlaneLowLambdaStreak = 0;
+
         float boost = 1.0f;
-        if(lambda < 0.5f)       boost = 5.0f;
-        else if(lambda < 0.7f)  boost = 4.0f;
-        else if(lambda < 0.85f) boost = 2.0f;
-        else if(lambda < 0.95f) boost = 1.5f;
+        const bool bSustained = (mnPlaneLowLambdaStreak >= 3);   // 连续多轮低 λ 才信
+        if(lambda < 0.5f)
+            boost = bSustained ? 2.0f : 1.2f;      // 严重塌缩：确认后上限 2×，否则温和
+        else if(lambda < 0.7f)
+            boost = bSustained ? 1.8f : 1.2f;      // 中度塌缩
+        else if(lambda < 0.85f)
+            boost = 1.5f;                          // 轻度偏离
+        else if(lambda < 0.95f)
+            boost = 1.2f;                          // 死区边缘
+        else
+            boost = 1.0f;                          // 死区：λ 健康不增强
 
         for(MapPoint* pMP : vpAllMPs) {
             if(!pMP || pMP->isBad() || pMP->mnPlaneID < 0) continue;
-            pMP->mfPlaneInfo = boost;
+            pMP->mfPlaneInfo = boost * ramp;       // 赋值（非 max 递增）：随当前 λ 自适应
         }
-
-        // 调试输出（每30帧一行）：λ、参考偏移、平面点状态、约束强度
-        cout << "[PlaneRemark] frame=" << mCurrentFrame.mnId
-             << " λ=" << lambda
-             << " d_ref=" << d_ref
-             << " d_dyn=" << d_dynamic
-             << " H_cam=" << camHeight
-             << " 平面点=" << nPlanePts
-             << " new=" << nNew << " rem=" << nRemoved
-             << " ratios=" << nRatiosOut
-             << " boost=" << boost
-             << " 回拉次数=" << mnScalePullbackCount << endl;
-
-        // λ 历史（最近10个），观察退化趋势
-        cout << "[PlaneRemark] λ历史:";
-        for(size_t i = (mvPlaneLambdaHist.size() > 10 ? mvPlaneLambdaHist.size() - 10 : 0);
-            i < mvPlaneLambdaHist.size(); i++)
-            cout << " " << mvPlaneLambdaHist[i];
-        cout << endl;
-
-        // 写入 plane_scale_debug.txt（CSV，每30帧一行，便于离线分析）
-        {
-            static bool bHeader = false;
-            std::ofstream fDbg("plane_scale_debug.txt", std::ios::out);  // 每次运行重新生成，便于对比
-            if(fDbg.is_open()) {
-                if(!bHeader) {
-                    fDbg << "frame_id,time_s,lambda,d_ref,d_dynamic,cam_height,n_plane_pts,n_new,n_removed,n_ratios,boost,n_pullbacks\n";
-                    bHeader = true;
-                }
-                fDbg << mCurrentFrame.mnId << "," << mCurrentFrame.mTimeStamp << ","
-                     << lambda << "," << d_ref << "," << d_dynamic << "," << camHeight << ","
-                     << nPlanePts << "," << nNew << "," << nRemoved << "," << nRatiosOut << ","
-                     << boost << "," << mnScalePullbackCount << "\n";
-            }
-        }
+        if(getenv("PLANE_DEBUG"))
+            cout << "[PlaneRemark] λ=" << lambda
+                 << " d_dyn=" << d_dynamic
+                 << " d_ref=" << d_ref
+                 << " boost=" << boost
+                 << " streak=" << mnPlaneLowLambdaStreak
+                 << " new=" << nNew << " removed=" << nRemoved << endl;
     }
 
     // 步骤6: 语义车辆高度统计与约束
@@ -6563,107 +7681,67 @@ void Tracking::PlaneRemark()
                 // 确保标记为平面点并增强约束权重
                 pMP->mnPlaneID = 0;
                 float currentInfo = pMP->mfPlaneInfo;
-                pMP->mfPlaneInfo = std::max(currentInfo, 3.0f);  // 车辆至少3倍权重
+                pMP->mfPlaneInfo = std::max(currentInfo, 3.0f * ramp);  // 车辆约束同样受平滑过渡约束
             }
         }
     }
-}
 
-/**
- * 尺度回拉请求/执行（Tracking请求 → LocalMapping安全点执行）
- *
- * 背景：早期版本在Tracking线程里"暂停LocalMapping→独占改图"，实测与
- * LocalMapping/LoopClosing的停止协议互踩——LocalMapping忙于处理关键帧队列
- * 数秒停不下来、地图锁被环回/合并/GBA长期占用，导致回拉几乎从未成功执行。
- *
- * 新方案：PlaneRemark只在Tracking线程登记请求（非阻塞，无任何等待）；
- * LocalMapping在Run循环的安全点（空闲、无并发写图）取出请求并执行缩放。
- * 该安全点天然满足独占性——LoopClosing/GBA改写地图前都会先暂停LocalMapping，
- * 因此执行时不会有其他线程同时改图。
- */
-void Tracking::RequestScalePullback(float lambda)
-{
-    unique_lock<mutex> lock(mMutexScalePullback);
-    mbScalePullbackPending = true;
-    mfScalePullbackLambda = lambda;
-}
-
-bool Tracking::ConsumeScalePullback(float& lambda)
-{
-    unique_lock<mutex> lock(mMutexScalePullback);
-    if(!mbScalePullbackPending) return false;
-    mbScalePullbackPending = false;
-    lambda = mfScalePullbackLambda;
-    return true;
-}
-
-void Tracking::ApplyScalePullback(float lambda)
-{
-    Map* pMap = mpAtlas->GetCurrentMap();
-    if(!pMap || !pMap->IsPlaneEstimated()) return;
-
-    const float s = 1.0f / std::max(lambda, 0.3f);   // λ封底0.3，单次放大不超过3.33倍
-    if(s < 1.001f) return;
-
-    // 与LoopClosing/GBA的地图更新串行化。在LocalMapping线程的安全点调用，
-    // 持锁时间短（纯算术缩放），不会长期阻塞其他线程
-    unique_lock<mutex> mapLock(pMap->mMutexMapUpdate);
-
-    // 1. 缩放所有关键帧平移（旋转不变）——先于点，供UpdateNormalAndDepth读取新位姿
-    vector<KeyFrame*> vKFs = pMap->GetAllKeyFrames();
-    for(KeyFrame* pKF : vKFs)
+    // ===== 步骤7: 物体位置稳定化——冻结静态3D框内地图点增强平面约束 =====
+    // 目的：已冻结(≥3次观测)的静态车辆框是稳定锚点，让落在其足迹内的地图点
+    // 获得更强的平面+高度约束，使静态物体上的点在局部/全局BA中不随帧漂移，
+    // 从而稳定物体层与稀疏点云层的对齐。
     {
-        Sophus::SE3f Tcw = pKF->GetPose();
-        Tcw.translation() *= s;
-        pKF->SetPose(Tcw);
-    }
+        const std::vector<Detection3D> vBoxes = pMap->GetPersistentBoxes();   // 拷贝防锁竞争
+        if(!vBoxes.empty() && mfVehicleRefHeight > 0.f)   // 未冻结车辆参考高度时不增强
+        {
+            for(MapPoint* pMP : vpAllMPs) {
+                if(!pMP || pMP->isBad()) continue;
+                if(pMP->mFeatureStatus == MapPoint::DYNAMIC) continue;
 
-    // 2. 缩放所有地图点并刷新尺度相关量
-    vector<MapPoint*> vMPs = pMap->GetAllMapPoints();
-    for(MapPoint* pMP : vMPs)
-    {
-        if(!pMP || pMP->isBad()) continue;
-        pMP->SetWorldPos(pMP->GetWorldPos() * s);
-        pMP->UpdateNormalAndDepth();
-    }
+                const Eigen::Vector3f Pw = pMP->GetWorldPos();
+                const float h = n.dot(Pw) - d_ref;
+                // 只约束贴近地面(高度在物体高度范围内)的点，避免把屋顶/天空点也拉下
+                if(h < -0.5f || h > mfVehicleRefHeight * 1.5f) continue;
 
-    // 3. 动态偏移量随尺度缩放（d_ref冻结不变）
-    pMap->SetPlaneDynamicOffset(pMap->GetPlaneDynamicOffset() * s);
+                // 找包含该点的冻结静态框（仅车辆类 2~9）
+                for(const Detection3D& b : vBoxes)
+                {
+                    if(!b.bValid || !b.bFrozen) continue;
+                    if(b.class_id < 2 || b.class_id > 9) continue;
+                    if(b.width <= 0.f || b.depth <= 0.f) continue;
 
-    // 4. 清空退化期收集的车辆高度样本（已被尺度污染，须在健康期重新统计）
-    mvVehicleHeightSamples.clear();
-
-    // 5. λ重置为健康值
-    pMap->SetPlaneScaleLambda(1.0f);
-
-    mnScalePullbackCount++;
-
-    // 6. 通知Tracking在Track()开头同步当前/上一帧位姿（保证与地图尺度一致）
-    mfPendingFrameScale.store(s);
-
-    cout << "[ScalePullback] #" << mnScalePullbackCount
-         << " lambda=" << lambda << " s=" << s
-         << " points=" << vMPs.size() << " kfs=" << vKFs.size()
-         << " d_ref(冻结)=" << pMap->GetPlaneRefOffset()
-         << " H_cam(冻结)=" << pMap->GetPlaneRefHeight()
-         << " d_dyn->" << pMap->GetPlaneDynamicOffset() << endl;
-}
-
-void Tracking::SyncCurrentFrameScale()
-{
-    const float s = mfPendingFrameScale.exchange(1.0f);
-    if(s < 0.999f || s > 1.001f)
-    {
-        // 点与位姿同因子绕原点缩放，重投影不变，跟踪无缝
-        Sophus::SE3f TcwCur = mCurrentFrame.GetPose();
-        TcwCur.translation() *= s;
-        mCurrentFrame.SetPose(TcwCur);
-
-        Sophus::SE3f TcwLast = mLastFrame.GetPose();
-        TcwLast.translation() *= s;
-        mLastFrame.SetPose(TcwLast);
-
-        mnLastScalePullbackFrameId = mCurrentFrame.mnId;
+                    // 平面内相对框中心的坐标（沿 heading 为长轴 depth，垂直为宽轴 width）
+                    const Eigen::Vector3f rel = Pw - n * h - b.center;   // 投影到平面的相对向量
+                    Eigen::Vector3f u, v;
+                    if(b.heading.squaredNorm() > 0.5f) {
+                        u = b.heading.normalized();
+                        v = n.cross(u).normalized();
+                    } else {
+                        // 无朝向时退化为圆足迹
+                        const float r = 0.5f * std::sqrt(std::max(b.width*b.depth, 1e-8f));
+                        if(rel.norm() <= r)
+                        {
+                            pMP->mnPlaneID = 0;
+                            pMP->mfSemanticHeightOffset = mfVehicleRefHeight;
+                            float currentInfo = pMP->mfPlaneInfo;
+                            pMP->mfPlaneInfo = std::max(currentInfo, 2.5f * ramp);
+                            break;
+                        }
+                        continue;
+                    }
+                    const float du = std::abs(rel.dot(u));   // 沿长轴
+                    const float dv = std::abs(rel.dot(v));   // 沿宽轴
+                    if(du <= 0.5f * b.depth + 0.3f && dv <= 0.5f * b.width + 0.3f)
+                    {
+                        pMP->mnPlaneID = 0;
+                        pMP->mfSemanticHeightOffset = mfVehicleRefHeight;
+                        float currentInfo = pMP->mfPlaneInfo;
+                        pMP->mfPlaneInfo = std::max(currentInfo, 2.5f * ramp);
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -6694,7 +7772,11 @@ void Tracking::DrawDynamicSemanticPoints()
     {
         if(idx >= mCurrentFrame.N)
             continue;
-        cv::Point2f pt = mCurrentFrame.mvKeysUn[idx].pt;
+        // 长短焦模式：在原始图像上绘制需用原始（校正前）坐标
+        // 非长短焦：显示图为原始(含畸变)图，用 mvKeys 而非 mvKeysUn 避免画偏
+        cv::Point2f pt = (Frame::mbMultiFocal && idx < (int)mCurrentFrame.refermvKeys.size())
+                         ? mCurrentFrame.refermvKeys[idx].pt
+                         : mCurrentFrame.mvKeys[idx].pt;
         cv::circle(mpDetector->mImg, pt, 8, cv::Scalar(0, 0, 255), -1);
     }
 }
@@ -6716,8 +7798,7 @@ void Tracking::VisualizeSemanticPoints(const std::vector<std::pair<int, int>>& s
         int fontFace = cv::FONT_HERSHEY_SIMPLEX;
         double fontScale = 0.5;
         int thickness = 1;
-        int baseline = 0;
-        
+
         // 根据初始化状态设置颜色：未初始化=红色，已初始化=绿色
         if (mbVibrationThresholdsInitialized) {
             textColor = cv::Scalar(0, 255, 0);  // 绿色（BGR格式）
@@ -6726,7 +7807,6 @@ void Tracking::VisualizeSemanticPoints(const std::vector<std::pair<int, int>>& s
         }
         // 第一行：旋转角度信息
         std::string rotationText = "Rotate: " + std::to_string(rotationAngle * 180/M_PI).substr(0, 5) + " rad";
-        cv::Size textSize = cv::getTextSize(rotationText, fontFace, fontScale, thickness, &baseline);
         cv::putText(visImage, rotationText, cv::Point(10, 25), fontFace, fontScale, textColor, thickness);
         
         // 第二行：旋转阈值信息
@@ -6763,12 +7843,35 @@ void Tracking::VisualizeSemanticPoints(const std::vector<std::pair<int, int>>& s
                 }
             }
             
-            // 获取特征点坐标
-            cv::Point2f currPt = mCurrentFrame.mvKeysUn[currIdx].pt;
+            // 获取特征点坐标（长短焦模式用原始坐标，与原始图像对齐）
+            // 单目：显示图像 mImGray 为原始(含畸变)图，必须用未去畸变的 mvKeys，
+            // 用 mvKeysUn 会把点画到畸变图外侧（与框/物体错位）
+            cv::Point2f currPt = (Frame::mbMultiFocal && currIdx < (int)mCurrentFrame.refermvKeys.size())
+                                 ? mCurrentFrame.refermvKeys[currIdx].pt
+                                 : mCurrentFrame.mvKeys[currIdx].pt;
             cv::Scalar color = isDynamic ? cv::Scalar(0, 0, 255) : cv::Scalar(255, 0, 0);
             
             // 绘制当前特征点（大圆）
             cv::circle(visImage, currPt, 4, color, -1);
+        }
+
+        // 绘制当前帧 2D 检测框（动态目标红色，静态目标类别色）
+        // 单目模式下框坐标为帧坐标系（与 mvKeysUn/mImGray 对齐）；
+        // 长短焦模式框坐标已校正到公共坐标系，与原始图特征点坐标系不一致，故不绘制
+        if (!Frame::mbMultiFocal) {
+            for(const auto& det : mCurrentFrame.detectedBoxes) {
+                const cv::Rect& box = det.bbox;
+                if(box.width < 1 || box.height < 1) continue;
+                cv::Scalar color;
+                if(det.is_dynamic) {
+                    color = cv::Scalar(0, 0, 255);   // 动态目标红色 (BGR)
+                } else {
+                    int ci = (det.class_id >= 0 && det.class_id < (int)COLORS.size())
+                             ? det.class_id : 0;
+                    color = cv::Scalar(COLORS[ci][2], COLORS[ci][1], COLORS[ci][0]);  // RGB→BGR
+                }
+                cv::rectangle(visImage, box, color, 2);
+            }
         }
         
         // 显示结果 → 写入 mImColor 供 FrameDrawer/Qt 使用

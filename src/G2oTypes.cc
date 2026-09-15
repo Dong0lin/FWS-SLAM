@@ -852,13 +852,6 @@ Eigen::Matrix3d RightJacobianSO3(const double x, const double y, const double z)
     }
 }
 
-Eigen::Matrix3d Skew(const Eigen::Vector3d &w)
-{
-    Eigen::Matrix3d W;
-    W << 0.0, -w[2], w[1],w[2], 0.0, -w[0],-w[1],  w[0], 0.0;
-    return W;
-}
-
 void EdgePlaneConstraint::linearizeOplus()
 {
     _jacobianOplusXi = mPlaneNormal.transpose();

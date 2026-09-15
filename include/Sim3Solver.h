@@ -44,7 +44,6 @@ public:
     Eigen::Matrix4f iterate(int nIterations, bool &bNoMore, std::vector<bool> &vbInliers, int &nInliers);
     Eigen::Matrix4f iterate(int nIterations, bool &bNoMore, vector<bool> &vbInliers, int &nInliers, bool &bConverge);
 
-    Eigen::Matrix4f GetEstimatedTransformation();
     Eigen::Matrix3f GetEstimatedRotation();
     Eigen::Vector3f GetEstimatedTranslation();
     float GetEstimatedScale();

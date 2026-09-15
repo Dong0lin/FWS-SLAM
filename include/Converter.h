@@ -57,19 +57,13 @@ public:
     static cv::Mat toCvMat(const Eigen::MatrixXd &m);
 
     static cv::Mat toCvSE3(const Eigen::Matrix<double,3,3> &R, const Eigen::Matrix<double,3,1> &t);
-    static cv::Mat tocvSkewMatrix(const cv::Mat &v);
 
     static Eigen::Matrix<double,3,1> toVector3d(const cv::Mat &cvVector);
     static Eigen::Matrix<float,3,1> toVector3f(const cv::Mat &cvVector);
     static Eigen::Matrix<double,3,1> toVector3d(const cv::Point3f &cvPoint);
     static Eigen::Matrix<double,3,3> toMatrix3d(const cv::Mat &cvMat3);
-    static Eigen::Matrix<double,4,4> toMatrix4d(const cv::Mat &cvMat4);
     static Eigen::Matrix<float,3,3> toMatrix3f(const cv::Mat &cvMat3);
-    static Eigen::Matrix<float,4,4> toMatrix4f(const cv::Mat &cvMat4);
     static std::vector<float> toQuaternion(const cv::Mat &M);
-
-    static bool isRotationMatrix(const cv::Mat &R);
-    static std::vector<float> toEuler(const cv::Mat &R);
 
     //TODO: Sophus migration, to be deleted in the future
     static Sophus::SE3<float> toSophus(const cv::Mat& T);

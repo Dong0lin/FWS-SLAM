@@ -122,6 +122,32 @@ namespace ORB_SLAM3 {
         cv::Mat M1r() {return M1r_;}
         cv::Mat M2r() {return M2r_;}
 
+        /*
+         * Multi-focal (long-short focal) stereo stuff
+         */
+        bool isMultiFocal() {return bMultiFocal_;}
+        std::string combine() {return combine_;}
+        cv::Mat leftK() {return leftK_;}
+        cv::Mat leftD() {return leftD_;}
+        cv::Mat leftR() {return leftR_;}
+        cv::Mat leftP() {return leftP_;}
+        cv::Mat rightK() {return rightK_;}
+        cv::Mat rightD() {return rightD_;}
+        cv::Mat rightR() {return rightR_;}
+        cv::Mat rightP() {return rightP_;}
+        float rightFocalX() {return rfx_;}
+        float rightFocalY() {return rfy_;}
+        float rightCx() {return rcx_;}
+        float rightCy() {return rcy_;}
+        float focalScale() {return fFscale_;}
+        float leftFocal() {return leftFocalMm_;}
+        float rightFocal() {return rightFocalMm_;}
+        bool focalMmSet() {return bFocalMmSet_;}
+        cv::Point2f roiLeftUp() {return roiLeftUp_;}
+        cv::Point2f roiRightBottom() {return roiRightBottom_;}
+        float minDepth() {return minDepth_;}
+        float maxDepth() {return maxDepth_;}
+
     private:
         template<typename T>
         T readParameter(cv::FileStorage& fSettings, const std::string& name, bool& found,const bool required = true){
@@ -146,6 +172,7 @@ namespace ORB_SLAM3 {
 
         void readCamera1(cv::FileStorage& fSettings);
         void readCamera2(cv::FileStorage& fSettings);
+        void readMultiFocal(cv::FileStorage& fSettings);
         void readImageInfo(cv::FileStorage& fSettings);
         void readIMU(cv::FileStorage& fSettings);
         void readRGBD(cv::FileStorage& fSettings);
@@ -173,6 +200,17 @@ namespace ORB_SLAM3 {
         bool bNeedToUndistort_;
         bool bNeedToRectify_;
         bool bNeedToResize1_, bNeedToResize2_;
+
+        bool bMultiFocal_;                 // 长短焦（多焦距）双目模式
+        std::string combine_;              // 焦距组合 "01"/"02"/"12"
+        cv::Mat leftK_, leftD_, leftR_, leftP_;
+        cv::Mat rightK_, rightD_, rightR_, rightP_;
+        float rfx_, rfy_, rcx_, rcy_;      // 右目（长焦）原始内参
+        float fFscale_;                    // 焦距比 右fx/左fx
+        float leftFocalMm_, rightFocalMm_; // 左右目焦距（mm），yaml 可选参数 Stereo.LeftFocal/RightFocal
+        bool bFocalMmSet_;                 // 是否由 yaml 焦距参数驱动（true → ROI/金字塔层数按焦距比算）
+        cv::Point2f roiLeftUp_, roiRightBottom_;   // 校正后左图重叠视场ROI
+        float minDepth_, maxDepth_;        // 立体深度合理性门控（假近点/假远点过滤）
 
         Sophus::SE3f Tlr_;
         float thDepth_;

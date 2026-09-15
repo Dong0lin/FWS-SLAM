@@ -438,11 +438,6 @@ void Sim3Solver::CheckInliers()
     }
 }
 
-Eigen::Matrix4f Sim3Solver::GetEstimatedTransformation()
-{
-    return mBestT12;
-}
-
 Eigen::Matrix3f Sim3Solver::GetEstimatedRotation()
 {
     return mBestRotation;

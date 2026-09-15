@@ -61,7 +61,6 @@ Eigen::Matrix3d InverseRightJacobianSO3(const Eigen::Vector3d &v);
 Eigen::Matrix3d RightJacobianSO3(const Eigen::Vector3d &v);
 Eigen::Matrix3d RightJacobianSO3(const double x, const double y, const double z);
 
-Eigen::Matrix3d Skew(const Eigen::Vector3d &w);
 Eigen::Matrix3d InverseRightJacobianSO3(const double x, const double y, const double z);
 
 template<typename T = double>

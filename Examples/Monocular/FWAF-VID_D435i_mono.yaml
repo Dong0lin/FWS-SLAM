@@ -1,0 +1,52 @@
+%YAML:1.0
+
+#--------------------------------------------------------------------------------------------
+# FWAF-VID dataset - RealSense D435i, PURE MONOCULAR (left infra1, rectified gray)
+# Calibration source: FWAF-VID-master/calibr/D435i+Build_in_IMU/imu_stereo-camchain-imucam.yaml (cam0)
+#--------------------------------------------------------------------------------------------
+File.version: "1.0"
+
+Camera.type: "PinHole"
+
+# Left camera (infra1) intrinsics, already rectified
+Camera1.fx: 385.9663579533714
+Camera1.fy: 386.66632586105874
+Camera1.cx: 326.31560591362586
+Camera1.cy: 228.94820856640544
+
+# images are pre-rectified -> no distortion
+Camera1.k1: 0.0
+Camera1.k2: 0.0
+Camera1.p1: 0.0
+Camera1.p2: 0.0
+
+Camera.width: 640
+Camera.height: 480
+
+Camera.fps: 30
+
+# Color order of the images (0: BGR, 1: RGB. It is ignored if images are grayscale)
+Camera.RGB: 1
+
+#--------------------------------------------------------------------------------------------
+# ORB Parameters
+#--------------------------------------------------------------------------------------------
+ORBextractor.nFeatures: 1250
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters
+#--------------------------------------------------------------------------------------------
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -3.5
+Viewer.ViewpointF: 500.0

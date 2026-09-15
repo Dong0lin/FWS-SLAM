@@ -33,6 +33,7 @@
 #include "SerializationUtils.h"
 
 #include <mutex>
+#include <vector>
 
 #include <boost/serialization/base_object.hpp>
 #include <boost/serialization/vector.hpp>
@@ -244,10 +245,13 @@ public:
 
     // Merge Edges
     void AddMergeEdge(KeyFrame* pKF);
-    set<KeyFrame*> GetMergeEdges();
+
+    // Semantic summary (class id -> observation count histogram, size=10)
+    // Used for loop/reloc semantic consistency check.
+    void SetSemanticSummary(const std::vector<int>& cnt);
+    std::vector<int> GetSemanticSummary();
 
     // MapPoint observation functions
-    int GetNumberMPs();
     void AddMapPoint(MapPoint* pMP, const size_t &idx);
     void EraseMapPointMatch(const int &idx);
     void EraseMapPointMatch(MapPoint* pMP);
@@ -294,7 +298,6 @@ public:
     IMU::Bias GetImuBias();
 
     bool ProjectPointDistort(MapPoint* pMP, cv::Point2f &kp, float &u, float &v);
-    bool ProjectPointUnDistort(MapPoint* pMP, cv::Point2f &kp, float &u, float &v);
 
     void PreSave(set<KeyFrame*>& spKF,set<MapPoint*>& spMP, set<GeometricCamera*>& spCam);
     void PostLoad(map<long unsigned int, KeyFrame*>& mpKFid, map<long unsigned int, MapPoint*>& mpMPid, map<unsigned int, GeometricCamera*>& mpCamId);
@@ -369,6 +372,20 @@ public:
     long unsigned int mnBALocalForMerge;
 
     float mfScale;
+
+    // Semantic summary: class_id -> observation count histogram (size=10).
+    // Thread-safety: written in Tracking (single writer), read in LoopClosing/KFDB.
+    // Guarded by mMutexFeatures for concurrent reads.
+    std::vector<int> mvSemanticSummary;
+
+    // Per-keypoint semantic class (-1 = non-semantic), copied from Frame at creation.
+    // Used by LoopClosing for point-level semantic inlier consistency checks.
+    // Written once in the constructor, read-only afterwards (no mutex needed).
+    std::vector<int> mvKeypointSemanticClass;
+    int GetKeyPointSemanticClass(int idx) const {
+        return (idx >= 0 && idx < (int)mvKeypointSemanticClass.size())
+               ? mvKeypointSemanticClass[idx] : -1;
+    }
 
     // Calibration parameters
     const float fx, fy, cx, cy, invfx, invfy, mbf, mb, mThDepth;
@@ -521,8 +538,6 @@ public:
     Sophus::SE3<float> GetRightPoseInverse();
 
     Eigen::Vector3f GetRightCameraCenter();
-    Eigen::Matrix<float,3,3> GetRightRotation();
-    Eigen::Vector3f GetRightTranslation();
 
     void PrintPointDistribution(){
         int left = 0, right = 0;

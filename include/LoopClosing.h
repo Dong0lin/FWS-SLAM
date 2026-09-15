@@ -29,7 +29,6 @@
 #include "KeyFrameDatabase.h"
 
 #include <boost/algorithm/string.hpp>
-#include <atomic>
 #include <thread>
 #include <mutex>
 #include "Thirdparty/g2o/g2o/types/types_seven_dof_expmap.h"
@@ -78,12 +77,6 @@ public:
         unique_lock<std::mutex> lock(mMutexGBA);
         return mbFinishedGBA;
     }   
-
-    // 环回修正/地图合并等"改写地图"操作进行中（供 Tracking 侧全局尺度回拉判断是否安全）
-    // 避免两个线程同时暂停 LocalMapping 并并发改写地图导致挂死/崩溃
-    bool IsMapBusy(){
-        return mbMapBusy.load();
-    }
 
     void RequestFinish();
 
@@ -149,8 +142,6 @@ protected:
     void MergeLocal();
     void MergeLocal2();
 
-    void CheckObservations(set<KeyFrame*> &spKFsMap1, set<KeyFrame*> &spKFsMap2);
-
     void ResetIfRequested();
     bool mbResetRequested;
     bool mbResetActiveMapRequested;
@@ -177,6 +168,15 @@ protected:
 
     // Loop detector parameters
     float mnCovisibilityConsistencyTh;
+
+    // 尺度退化程度 deg∈[0,1]，由当前地图平面 λ 导出：
+    //   deg=0 尺度健康（行为与原始一致），deg=1 尺度严重退化。
+    // 仅用于自适应放宽"召回级"阈值（候选数/共视词门槛/时间一致性帧数），
+    // 末端几何确认（Sim3 inlier/重投影）保持原状，避免低尺度时放进假回环。
+    float mfScaleDegradation = 0.0f;
+
+    // 时间一致确认帧数：退化严重时 3→2（召回更积极）
+    int RequiredCoincidences() const { return (mfScaleDegradation > 0.5f) ? 2 : 3; }
 
     // Loop detector variables
     KeyFrame* mpCurrentKF;
@@ -225,9 +225,6 @@ protected:
     bool mbStopGBA;
     std::mutex mMutexGBA;
     std::thread* mpThreadGBA;
-
-    // 环回/合并写地图期间的忙标志（RAII管理，见 LoopClosing.cc 的 LoopMapBusyGuard）
-    std::atomic<bool> mbMapBusy;
 
     // Fix scale in the stereo/RGB-D case
     bool mbFixScale;

@@ -117,6 +117,15 @@ cv::Mat FrameDrawer::DrawFrame(float imageScale)
     if(im.channels()<3) //this should be always true
         cvtColor(im,im,cv::COLOR_GRAY2BGR);
 
+    // 动态一致性模式：mIm 已由 VisualizeSemanticPoints 写入语义点+检测框，
+    // 直接返回，不叠加 ORB 特征点（避免与语义点混淆）
+    if(mbShowDynamicVis)
+    {
+        cv::Mat imWithInfo;
+        DrawTextInfo(im, state, imWithInfo);
+        return imWithInfo;
+    }
+
     //Draw
     if(state==Tracking::NOT_INITIALIZED)
     {
@@ -164,7 +173,27 @@ cv::Mat FrameDrawer::DrawFrame(float imageScale)
         for(int i=0;i<n;i++)
         {
             bool isOutlier = (i < static_cast<int>(vbOutlier.size())) && vbOutlier[i];
-            if(vbVO[i] || vbMap[i] || isOutlier)
+            bool bTracked = (i < static_cast<int>(vbVO.size())) && (i < static_cast<int>(vbMap.size())) &&
+                            (vbVO[i] || vbMap[i]);
+            // 本帧是否与长焦图像立体匹配成功（有深度）
+            bool bStereoMatched = (i < static_cast<int>(vCurrentDepth.size())) && vCurrentDepth[i] > 0.f;
+            float prob = (i < static_cast<int>(vMovingProb.size())) ? vMovingProb[i] : 0.0f;
+
+            // 颜色统一：动态语义=红，静态语义=蓝，
+            // 与长焦匹配成功的非语义点=紫，已跟踪但本帧无立体匹配=绿
+            cv::Scalar color;
+            if(prob > 0.5f)
+                color = cv::Scalar(0, 0, 255);       // 红 → 动态
+            else if(prob > 0.0f)
+                color = cv::Scalar(255, 0, 0);       // 蓝 → 静态语义
+            else if(bStereoMatched)
+                color = cv::Scalar(255, 0, 255);     // 紫 → 与长焦匹配成功（非语义）
+            else if(bTracked || isOutlier)
+                color = cv::Scalar(0, 255, 0);       // 绿 → 已跟踪但无立体匹配
+            else
+                continue;
+
+            if(bTracked)
             {
                 cv::Point2f pt1,pt2;
                 cv::Point2f point;
@@ -187,30 +216,40 @@ cv::Mat FrameDrawer::DrawFrame(float imageScale)
                     pt2.y=vCurrentKeys[i].pt.y+r;
                 }
 
-                // 根据动态概率选择颜色：红色=动态，绿色=静态，蓝色=一般
-                float prob = (i < static_cast<int>(vMovingProb.size()))
-                             ? vMovingProb[i] : 0.0f;
-                cv::Scalar color;
-                if(prob > 0.5f)
-                    color = cv::Scalar(0, 0, 255);       // 红色 → 动态
-                else if(prob > 0.0f)
-                    color = cv::Scalar(255, 0, 0);       // 蓝色 → 静态（已被精化分类）
-                else if(vbMap[i])
-                    color = cv::Scalar(0, 255, 0);       // 绿色 → 一般地图点（未分类）
-                else
-                    color = cv::Scalar(0, 255, 0);       // 绿色 → 一般VO点
-
                 if(isOutlier)
-                    cv::circle(im,point,2,color,-1);     // outlier空心圆
-                else {
-                    cv::rectangle(im,pt1,pt2,color);
-                    cv::circle(im,point,2,color,-1);     // 填充方块+圆
+                    cv::circle(im, point, 2, color, -1);  // 外点：空心小圆
+                else
+                {
+                    cv::rectangle(im, pt1, pt2, color);
+                    cv::circle(im, point, 2, color, -1);  // 跟踪点：方块+圆
                 }
 
                 if(vbMap[i])
                     mnTracked++;
                 else
                     mnTrackedVO++;
+            }
+            else
+            {
+                // 仅立体匹配成功（未入地图）：小圆点
+                cv::circle(im, vCurrentKeys[i].pt, 2, color, -1);
+            }
+        }
+
+        // 长短焦模式：画出重叠视场ROI框（细紫框，加"ROI"标签，
+        // 避免与目标检测框混淆——它代表长焦视场在左图的对应区域）
+        if(both)
+        {
+            if(ORB_SLAM3::Frame::mbMultiFocal &&
+               ORB_SLAM3::Frame::mROIRightBottom.x > ORB_SLAM3::Frame::mROILeftUp.x)
+            {
+                cv::rectangle(im,
+                              cv::Point2f(ORB_SLAM3::Frame::mROILeftUp.x, ORB_SLAM3::Frame::mROILeftUp.y),
+                              cv::Point2f(ORB_SLAM3::Frame::mROIRightBottom.x, ORB_SLAM3::Frame::mROIRightBottom.y),
+                              cv::Scalar(255,0,255), 1);
+                cv::putText(im, "ROI", cv::Point2f(ORB_SLAM3::Frame::mROILeftUp.x + 3,
+                                                   ORB_SLAM3::Frame::mROILeftUp.y + 14),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(255, 0, 255), 1);
             }
         }
     }
@@ -306,55 +345,67 @@ cv::Mat FrameDrawer::DrawRightFrame(float imageScale)
         {
             int idx = i + Nleft;
             bool isOutlier = (idx < static_cast<int>(vbOutlier.size())) && vbOutlier[idx];
-            if(vbVO[idx] || vbMap[idx] || isOutlier)
+            // 长短焦模式：右目特征点若与左目成功立体匹配（RightIdToLeftId>=0），也绘制出来
+            bool bStereoMatched = (mCurrentFrame.RightIdToLeftId.size() > (size_t)i) &&
+                                  (mCurrentFrame.RightIdToLeftId[i] >= 0);
+            bool bTracked = (idx < static_cast<int>(vbVO.size())) && (idx < static_cast<int>(vbMap.size())) &&
+                            (vbVO[idx] || vbMap[idx]);
+            float prob = (idx < static_cast<int>(vMovingProb.size())) ? vMovingProb[idx] : 0.0f;
+
+            // 颜色统一：动态语义=红，静态语义=蓝，
+            // 与左目匹配成功的非语义点=紫，已跟踪非语义=绿，未匹配=灰
+            cv::Scalar color;
+            if(prob > 0.5f)
+                color = cv::Scalar(0, 0, 255);       // 红 → 动态
+            else if(prob > 0.0f)
+                color = cv::Scalar(255, 0, 0);       // 蓝 → 静态语义
+            else if(bStereoMatched)
+                color = cv::Scalar(255, 0, 255);     // 紫 → 与左目匹配成功（非语义）
+            else if(bTracked || isOutlier)
+                color = cv::Scalar(0, 255, 0);       // 绿 → 已跟踪（非语义）
+            else
             {
-                cv::Point2f pt1,pt2;
-                cv::Point2f point;
-                if(imageScale != 1.f)
-                {
-                    point = mvCurrentKeysRight[i].pt / imageScale;
-                    float px = mvCurrentKeysRight[i].pt.x / imageScale;
-                    float py = mvCurrentKeysRight[i].pt.y / imageScale;
-                    pt1.x=px-r;
-                    pt1.y=py-r;
-                    pt2.x=px+r;
-                    pt2.y=py+r;
-                }
-                else
-                {
-                    point = mvCurrentKeysRight[i].pt;
-                    pt1.x=mvCurrentKeysRight[i].pt.x-r;
-                    pt1.y=mvCurrentKeysRight[i].pt.y-r;
-                    pt2.x=mvCurrentKeysRight[i].pt.x+r;
-                    pt2.y=mvCurrentKeysRight[i].pt.y+r;
-                }
-
-                // 根据动态概率选择颜色：红色=动态，绿色=静态，蓝色=一般
-                int idx = i + Nleft;
-                float prob = (idx < static_cast<int>(vMovingProb.size()))
-                             ? vMovingProb[idx] : 0.0f;
-                cv::Scalar color;
-                if(prob > 0.5f)
-                    color = cv::Scalar(0, 0, 255);       // 红色 → 动态
-                else if(prob > 0.0f)
-                    color = cv::Scalar(0, 255, 0);       // 绿色 → 静态（已被精化分类）
-                else if(vbMap[idx])
-                    color = cv::Scalar(255, 0, 0);       // 蓝色 → 一般地图点（未分类）
-                else
-                    color = cv::Scalar(255, 0, 0);       // 蓝色 → 一般VO点
-
-                if(isOutlier)
-                    cv::circle(im,point,2,color,-1);     // outlier空心圆
-                else {
-                    cv::rectangle(im,pt1,pt2,color);
-                    cv::circle(im,point,2,color,-1);     // 填充方块+圆
-                }
-
-                if(vbMap[idx])
-                    mnTracked++;
-                else
-                    mnTrackedVO++;
+                // 未匹配的右目特征点：灰色小点（便于观察长焦特征提取情况）
+                if(ORB_SLAM3::Frame::mbMultiFocal)
+                    cv::circle(im, mvCurrentKeysRight[i].pt, 1, cv::Scalar(128,128,128), -1);
+                continue;
             }
+
+            cv::Point2f pt1,pt2;
+            cv::Point2f point;
+            if(imageScale != 1.f)
+            {
+                point = mvCurrentKeysRight[i].pt / imageScale;
+                float px = mvCurrentKeysRight[i].pt.x / imageScale;
+                float py = mvCurrentKeysRight[i].pt.y / imageScale;
+                pt1.x=px-r;
+                pt1.y=py-r;
+                pt2.x=px+r;
+                pt2.y=py+r;
+            }
+            else
+            {
+                point = mvCurrentKeysRight[i].pt;
+                pt1.x=mvCurrentKeysRight[i].pt.x-r;
+                pt1.y=mvCurrentKeysRight[i].pt.y-r;
+                pt2.x=mvCurrentKeysRight[i].pt.x+r;
+                pt2.y=mvCurrentKeysRight[i].pt.y+r;
+            }
+
+            if(bTracked && !isOutlier)
+            {
+                cv::rectangle(im, pt1, pt2, color);
+                cv::circle(im, point, 2, color, -1);     // 跟踪点：方块+圆
+            }
+            else
+            {
+                cv::circle(im, point, 2, color, -1);     // 匹配成功/外点：小圆
+            }
+
+            if(vbMap[idx])
+                mnTracked++;
+            else
+                mnTrackedVO++;
         }
     }
 
@@ -416,7 +467,10 @@ void FrameDrawer::DrawTextInfo(cv::Mat &im, int nState, cv::Mat &imText)
 void FrameDrawer::Update(Tracking *pTracker)
 {
     unique_lock<mutex> lock(mMutex);
-    
+
+    // 动态一致性模式：mIm 已包含语义点+检测框可视化，DrawFrame 不再叠加 ORB 特征点
+    mbShowDynamicVis = pTracker->IsShowDynamicVis();
+
     // 优先使用Detector绘制检测框后的彩色图像
     if(pTracker-> mImColor.data != nullptr)
     {
@@ -428,13 +482,32 @@ void FrameDrawer::Update(Tracking *pTracker)
     {
         pTracker->mImGray.copyTo(mIm);
     }
-    mvCurrentKeys=pTracker->mCurrentFrame.mvKeys;
+    // 长短焦模式：显示的是原始（未校正）图像，特征点必须用原始坐标绘制，
+    // 否则与检测框/图像内容错位（校正坐标相对原始坐标有缩放平移）
+    if(ORB_SLAM3::Frame::mbMultiFocal &&
+       pTracker->mCurrentFrame.refermvKeys.size() == (size_t)pTracker->mCurrentFrame.N)
+        mvCurrentKeys = pTracker->mCurrentFrame.refermvKeys;
+    else
+        mvCurrentKeys = pTracker->mCurrentFrame.mvKeys;
     mThDepth = pTracker->mCurrentFrame.mThDepth;
     mvCurrentDepth = pTracker->mCurrentFrame.mvDepth;
 
     if(both){
-        mvCurrentKeysRight = pTracker->mCurrentFrame.mvKeysRight;
-        pTracker->mImRight.copyTo(mImRight);
+        if(ORB_SLAM3::Frame::mbMultiFocal &&
+           pTracker->mCurrentFrame.refermvKeysRight.size() == pTracker->mCurrentFrame.mvKeysRight.size())
+            mvCurrentKeysRight = pTracker->mCurrentFrame.refermvKeysRight;
+        else
+            mvCurrentKeysRight = pTracker->mCurrentFrame.mvKeysRight;
+        // 优先使用带右目检测框的彩色图像（Tracking 已把右目检测结果画在 mImColorRight 上）
+        if(pTracker->mImColorRight.data != nullptr)
+        {
+            pTracker->mImColorRight.copyTo(mImRight);
+            pTracker->mImColorRight.release(); // 释放引用，避免占用过多内存
+        }
+        else
+        {
+            pTracker->mImRight.copyTo(mImRight);
+        }
         N = mvCurrentKeys.size() + mvCurrentKeysRight.size();
     }
     else{
@@ -468,7 +541,10 @@ void FrameDrawer::Update(Tracking *pTracker)
     }
     else if(pTracker->mLastProcessedState==Tracking::OK)
     {
-        for(int i=0;i<N;i++)
+        // 修复：旧式双目（含长短焦模式）Frame::N 是左目特征数，
+        // 而这里的 N 是 左+右 合并数，直接循环会越界读取 mvpMapPoints/mvbOutlier
+        const int nTrackedKeys = pTracker->mCurrentFrame.N;
+        for(int i=0; i<nTrackedKeys && i<N; i++)
         {
             MapPoint* pMP = pTracker->mCurrentFrame.mvpMapPoints[i];
             if(pMP)

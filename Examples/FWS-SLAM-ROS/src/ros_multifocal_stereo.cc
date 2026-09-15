@@ -17,10 +17,11 @@
 */
 
 /**
- * ros_mono_stereo_left.cc — 语义 SLAM 版 (ROS 发布)
+ * ros_multifocal_stereo.cc — 长短焦双目语义 SLAM 版 (ROS 发布)
  *
- * 针对单 USB 双目相机（输出 2560×720 拼接图像）的单目语义 SLAM 节点。
- * 自动从拼接图像中裁剪左半部分（1280×720）用于语义 SLAM 单目模式。
+ * 针对单 USB 长短焦双目相机（输出 2560×720 拼接图像：左半=短焦 1280×720、
+ * 右半=长焦 1280×720）的语义 SLAM 双目节点。
+ * 从拼接图像裁剪左右两半，分别作为左目(短焦)与右目(长焦)，运行双目长短焦 SLAM。
  * 使用 Pangolin 可视化（非 Qt），用于调试和独立测试。
  *
  * 发布的 ROS 话题:
@@ -34,7 +35,7 @@
  *   tf               (tf/tfMessage)               相机坐标系变换
  *
  * 用法:
- *   rosrun FWS-SLAM-ROS Mono_Stereo_Left <vocab> <settings>
+ *   rosrun FWS-SLAM-ROS MultiFocal_Stereo <vocab> <settings>
  *
  * 参数:
  *   ~image_topic (string, default: "/usb_cam/image_raw")
@@ -46,6 +47,7 @@
 #include<fstream>
 #include<chrono>
 #include<csignal>
+#include<cstdlib>
 
 #include<ros/ros.h>
 #include<ros/package.h>
@@ -161,12 +163,36 @@ void ImageGrabber::GrabImage(const sensor_msgs::ImageConstPtr& msg)
 
     cv::Mat imgFull = cv_ptr->image;
 
-    // 裁剪左半部分：双目拼接 2560×720 → 左目 1280×720
+    // 长短焦拼接图像 2560×720 → 左半=短焦 1280×720、右半=长焦 1280×720
     int fullW = imgFull.cols;
     int halfW = fullW / 2;
-    cv::Mat imgLeft = imgFull(cv::Rect(0, 0, halfW, imgFull.rows)).clone();
+    cv::Mat imgLeft  = imgFull(cv::Rect(0, 0, halfW, imgFull.rows)).clone();
+    cv::Mat imgRight = imgFull(cv::Rect(halfW, 0, fullW - halfW, imgFull.rows)).clone();
 
-    mpSLAM->TrackMonocular(imgLeft, cv_ptr->header.stamp.toSec());
+    // 临时补偿：MF_VSHIFT=<px> 把右半图整体上移（实机拼接图常见固定垂直偏移，
+    // 实测本机右目相对左目低约 32px → MF_VSHIFT=32）。默认关闭，正式使用请重新标定。
+    if (const char* ev = getenv("MF_VSHIFT")) {
+        int vy = atoi(ev);
+        if (vy > 0 && vy < imgRight.rows) {
+            cv::Mat shifted(imgRight.rows, imgRight.cols, imgRight.type(), cv::Scalar(0, 0, 0));
+            imgRight(cv::Rect(0, vy, imgRight.cols, imgRight.rows - vy))
+                    .copyTo(shifted(cv::Rect(0, 0, imgRight.cols, imgRight.rows - vy)));
+            imgRight = shifted;
+            ROS_WARN("MF_VSHIFT=%d：右半图上移 %d 像素（临时补偿，正式使用请重新标定）", vy, vy);
+        }
+    }
+
+    // 诊断：MF_DUMP_IMGS=1 保存前 10 帧左右半图，核对拼接布局/右目是否黑屏
+    static int dumpCount = 0;
+    if (getenv("MF_DUMP_IMGS") && dumpCount < 10) {
+        cv::imwrite("/tmp/mf_ros_left_" + std::to_string(dumpCount) + ".jpg", imgLeft);
+        cv::imwrite("/tmp/mf_ros_right_" + std::to_string(dumpCount) + ".jpg", imgRight);
+        ROS_INFO("已保存诊断图 /tmp/mf_ros_left_%d.jpg 与 /tmp/mf_ros_right_%d.jpg",
+                 dumpCount, dumpCount);
+        dumpCount++;
+    }
+
+    mpSLAM->TrackStereo(imgLeft, imgRight, cv_ptr->header.stamp.toSec());
 
     // ── 每帧发布相机位姿和轨迹 ──
     ORB_SLAM3::MapDrawer* pMapDrawer = mpSLAM->GetMapDrawer();
@@ -363,11 +389,31 @@ void ImageGrabber::PublishSemanticData(const ros::TimerEvent&)
             m.pose.position.x = box.center.x();
             m.pose.position.y = box.center.y();
             m.pose.position.z = box.center.z() + box.height * 0.5f; // 中心在底面+半高
-            m.pose.orientation.w = 1.0;
 
             m.scale.x = box.width;
             m.scale.y = box.depth;
             m.scale.z = box.height;
+
+            // 朝向：CUBE 本地坐标 X=宽、Y=深(车长)、Z=高 →
+            // 世界 U=车宽方向、V=车长方向(heading)、N=平面法向
+            Eigen::Vector3f N = pMap->GetPlaneNormal().normalized();
+            Eigen::Vector3f U, V;
+            if (box.heading.squaredNorm() > 0.5f) {
+                V = box.heading.normalized();
+                U = N.cross(V).normalized();
+            } else {
+                Eigen::Vector3f ref = (std::abs(N.x()) < 0.9f)
+                                      ? Eigen::Vector3f::UnitX() : Eigen::Vector3f::UnitZ();
+                U = N.cross(ref).normalized();
+                V = N.cross(U).normalized();
+            }
+            Eigen::Matrix3f R;
+            R.col(0) = U; R.col(1) = V; R.col(2) = N;
+            Eigen::Quaternionf q(R);
+            m.pose.orientation.x = q.x();
+            m.pose.orientation.y = q.y();
+            m.pose.orientation.z = q.z();
+            m.pose.orientation.w = q.w();
 
             // 类别颜色
             const auto& c = COLORS[box.class_id % COLORS.size()];
@@ -424,7 +470,7 @@ void ImageGrabber::PublishSemanticData(const ros::TimerEvent&)
 
 int main(int argc, char **argv)
 {
-    ros::init(argc, argv, "Mono_Stereo_Left");
+    ros::init(argc, argv, "MultiFocal_Stereo");
     ros::start();
 
     signal(SIGINT,  SignalHandler);
@@ -432,14 +478,15 @@ int main(int argc, char **argv)
 
     if(argc != 3)
     {
-        cerr << endl << "用法: rosrun FWS-SLAM-ROS Mono_Stereo_Left path_to_vocabulary path_to_settings" << endl;
+        cerr << endl << "用法: rosrun FWS-SLAM-ROS MultiFocal_Stereo path_to_vocabulary path_to_settings" << endl;
         ros::shutdown();
         return 1;
     }
 
     // 使用 VIEWER_PANGOLIN 模式（有 Pangolin 可视化窗口）
     // 注意：这是语义 SLAM 版本，包含目标检测、动态一致性等增强功能
-    ORB_SLAM3::System SLAM(argv[1], argv[2], ORB_SLAM3::System::MONOCULAR, ORB_SLAM3::System::VIEWER_PANGOLIN);
+    // 长短焦双目：拼接图左右两半分别作为短焦/长焦，走双目 SLAM
+    ORB_SLAM3::System SLAM(argv[1], argv[2], ORB_SLAM3::System::STEREO, ORB_SLAM3::System::VIEWER_PANGOLIN);
 
     ros::NodeHandle nh("~");
 

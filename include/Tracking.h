@@ -43,7 +43,6 @@
 #include "ImageQuality.h"
 
 #include <mutex>
-#include <atomic>
 #include <unordered_set>
 
 // #include "pointcloudmapping.h"
@@ -101,20 +100,18 @@ public:
     void SetViewer(Viewer* pViewer);
     void SetDetector(Detector* pDetector);
     void SetStepByStep(bool bSet);
-    bool GetStepByStep();
 
     // 3D 检测框开关
     void SetEnable3DBoxDetection(bool flag) { mbEnable3DBoxDetection = flag; }
     bool Is3DBoxDetectionEnabled()          { return mbEnable3DBoxDetection; }
+    // 图像/匹配质量日志：默认关闭；开启时打开 image_quality.txt 并按30帧采样写入
+    void SetSaveQuality(bool flag);
 
     // 动态一致性可视化开关（替代检测框绘制，用于 Qt 界面）
     void SetShowDynamicVis(bool flag)       { mbShowDynamicVis = flag; }
     bool IsShowDynamicVis()                 { return mbShowDynamicVis; }
 
     // Load new settings
-    // The focal lenght should be similar or scale prediction will fail when projecting points
-    void ChangeCalibration(const string &strSettingPath);
-
     // Use this function if you have deactivated local mapping and you only want to localize the camera.
     void InformOnlyTracking(const bool &flag);
 
@@ -130,7 +127,6 @@ public:
 
     //--
     void NewDataset();
-    int GetNumberDataset();
     int GetMatchesInliers();
 
     //DEBUG
@@ -165,12 +161,6 @@ public:
     // Input sensor
     int mSensor;
 
-    // 尺度回拉请求/执行接口（LocalMapping安全点会调用Consume/Apply）
-    void RequestScalePullback(float lambda);            // PlaneRemark调用（非阻塞）
-    bool ConsumeScalePullback(float& lambda);           // LocalMapping安全点调用（取走请求）
-    void ApplyScalePullback(float lambda);              // 在LocalMapping线程执行地图缩放
-    void SyncCurrentFrameScale();                       // Track()开头同步当前/上一帧位姿缩放
-
     // Current Frame
     Frame mCurrentFrame;
     Frame mLastFrame;
@@ -179,6 +169,7 @@ public:
     cv::Mat imDepth; // adding mImDepth member to realize pointcloud view
 
     cv::Mat mImColor;//保存来自Detector的带有检测框的图像，供FrameDrawer使用
+    cv::Mat mImColorRight;//右目检测框绘制后的图像，供FrameDrawer右窗口显示
 
     // Initialization Variables (Monocular)
     std::vector<int> mvIniLastMatches;
@@ -218,8 +209,10 @@ public:
     
         //detection functions/variables
 	void GetImgForDetector(const cv::Mat& img);
-	bool isNewDetectedImgArrived();
+	void GetImgForDetector(const cv::Mat& imgLeft, const cv::Mat& imgRight);  // 双目：左+右一起送入检测线程
+	void SetDetectorRight(Detector* pDetector) { mpDetectorRight = pDetector; }  // 右目独立检测线程（长短焦模式）
 	bool mbNewDetImgFlag;
+	bool mbNewDetImgFlagRight;
 
 	// 检测完成等待：用条件变量替代 usleep 忙等待
 	void WaitForDetection();
@@ -247,6 +240,8 @@ protected:
 
     // Map initialization for stereo and RGB-D
     void StereoInitialization();
+    // 双目初始化质量评估（针对扑翼航拍：有效深度点数量 + 空间网格覆盖率）
+    bool CheckInitializationQuality(int &nValidDepthPoints, int &nOccupiedCells);
 
     // Map initialization for monocular
     void MonocularInitialization();
@@ -257,7 +252,14 @@ protected:
     void FitGroundPlane();               // 拟合地面平面0(100帧后执行)
     void PlaneRemark();                  // 每30帧刷新平面标记 + 动态偏移量 + λ + BA约束强度
     void ProjectPlanePoints();           // 将平面归属点硬投影到平面上（锚定尺度）
-    void Lift2DBoxesTo3D();              // 2D检测框 → 3D框 (Cube-SLAM风格)
+    void Lift2DBoxesTo3D();              // 2D检测框 → 3D框：按模式分发（单目/长短焦）
+    void Lift2DBoxesTo3D_Mono();         // 单目模式实现（地面反投影 + 高度/先验融合）
+    void Lift2DBoxesTo3D_Stereo();       // 长短焦模式实现（左右目匹配+前后帧匹配特征点）
+    // 单目：2D框+位姿+地面平面 → 地面足迹（位置/朝向/宽深）。
+    // 不依赖稀疏地图点/立体视差，远距离航拍下更稳。失败(无平面/射线不相交)返回 false。
+    bool EstimateGroundFootprintMono(const Detection& det, Eigen::Vector3f& P_ctr,
+                                     Eigen::Vector3f& heading, float& widthSlam, float& depthSlam);
+    void AlignBoxRows();                 // 持续维护：同类成排目标微调位置/朝向（中心近+共线）
 
     void CheckReplacedInLastFrame();
     bool TrackReferenceKeyFrame();
@@ -296,6 +298,9 @@ protected:
     bool NeedNewKeyFrame();
     void CreateNewKeyFrame();
 
+    // 用当前帧检测框填充关键帧的语义概要（类别直方图），供回环/重定位语义校验使用
+    void UpdateKeyFrameSemanticSummary(KeyFrame* pKF);
+
     // Perform preintegration from last frame
     void PreintegrateIMU();
 
@@ -330,6 +335,7 @@ protected:
     LocalMapping* mpLocalMapper;
     LoopClosing* mpLoopClosing;
     Detector* mpDetector;
+    Detector* mpDetectorRight = nullptr;   // 右目（长焦）独立检测线程，仅长短焦模式创建
     	
 
     //ORB
@@ -383,6 +389,9 @@ protected:
     // Points seen as close by the stereo/RGBD sensor are considered reliable
     // and inserted from just one frame. Far points requiere a match in two keyframes.
     float mThDepth;
+    // 立体深度合理性门控（长短焦模式）：太近/太远的深度点不建图
+    float mfMinDepth = 0.f;
+    float mfMaxDepth = 1e9f;
 
     // For RGB-D inputs only. For some datasets (e.g. TUM) the depthmap values are scaled.
     float mDepthMapFactor;
@@ -409,7 +418,7 @@ protected:
 
     //Color order (true RGB, false BGR, ignored if grayscale)
     bool mbRGB;
-    bool mbEnable3DBoxDetection{false};  // 3D检测框开关（默认关闭）
+    bool mbEnable3DBoxDetection{true};   // 3D检测框开关（默认开启：语义分层静态物体建图）
     bool mbShowDynamicVis{false};         // 动态一致性可视化开关（默认关闭）
 
     list<MapPoint*> mlpTemporalPoints;
@@ -470,6 +479,9 @@ protected:
     long unsigned int mMonoInitFrameId;     // 单目初始化完成时的帧ID
     bool  mbPlaneFitted;                    // 平面是否已拟合
     long unsigned int mnLastPlaneCollectKFId;  // 上次收集数据时的关键帧ID（仅关键帧更新时收集）
+    long unsigned int mnPlaneFitFrameId = 0;   // FitGroundPlane 完成时的帧ID（平面约束权重平滑过渡用）
+    long unsigned int mnPlaneFitNextRetry = 0; // 拟合失败后的下次重试帧ID（避免每帧都跑RANSAC）
+    int mnPlaneLowLambdaStreak = 0;            // λ<0.7 的连续轮数（每30帧一轮），用于“连续确认”后才增强平面约束
     std::unordered_set<MapPoint*> mspGroundPoints;  // 收集的语义地面点指针（去重，拟合时实时读取坐标）
     std::unordered_set<MapPoint*> mspAllPoints;     // 收集的所有点指针（去重，拟合时实时读取坐标）
 
@@ -478,22 +490,9 @@ protected:
     float mfVehicleRefHeight;                    // 冻结的车辆参考高度（中位数）
     bool  mbVehicleHeightFrozen;                 // 是否已冻结（lambda>0.85时触发）
 
-    // 全局尺度回拉（绕圆/旋转主导场景下单目尺度快速退化的整体补偿）
-    long unsigned int mnLastScalePullbackFrameId = 0;  // 上次回拉时的帧ID（间隔门控，防振荡）
-    long unsigned int mnLastPullbackAttemptFrameId = 0; // 上次尝试回拉的帧ID（防止失败后每30帧空转重试）
-    unsigned int mnScalePullbackCount = 0;             // 回拉次数统计
-    std::vector<float> mvPlaneLambdaHist;              // λ历史（PlaneRemark每次记录，调试用）
-
-    // 尺度回拉改为"Tracking请求→LocalMapping安全点执行"：
-    // Tracking线程不暂停LocalMapping、不抢地图锁（避免与LocalMapping/LoopClosing的
-    // 停止-独占协议互踩导致回拉永远无法执行或挂死）。
-    std::mutex mMutexScalePullback;                     // 保护以下请求字段
-    bool mbScalePullbackPending = false;                // 有待执行的回拉请求
-    float mfScalePullbackLambda = 1.0f;                 // 请求的λ
-    std::atomic<float> mfPendingFrameScale;             // 回拉已应用后待Tracking同步的帧位姿缩放
-
     std::vector<Detection3D> mvDetection3Ds;        // 3D检测框：每帧Lift2DBoxesTo3D的结果
     long unsigned int mnLastLift3DFrameId = 0;      // 上次执行Lift2DBoxesTo3D的帧ID（频率控制）
+    long unsigned int mnLastAlignRowsFrameId = 0;   // 上次执行AlignBoxRows的帧ID（频率控制）
 
     double mTime_PreIntIMU;
     double mTime_PosePred;
@@ -544,11 +543,21 @@ public:
     double mdStageOrbExtract   = 0.0;  ///< 累计 ORB 特征提取耗时(ms)
     double mdStageWaitDetect   = 0.0;  ///< 累计等待目标检测耗时(ms)
     double mdStageTrack        = 0.0;  ///< 累计 Track() 核心耗时(ms)
+    double mdStageSemantic     = 0.0;  ///< 累计 振动+动态点+地面+3D框 语义管线耗时(ms)
+    double mdStageSemVibration = 0.0;  ///< 累计 振动指标计算 耗时(ms)
+    double mdStageSemDynamic   = 0.0;  ///< 累计 动态点检测/分类/离群标记 耗时(ms)
+    double mdStageSemGround    = 0.0;  ///< 累计 地面点收集+平面标记 耗时(ms)
+    double mdStageSemLift      = 0.0;  ///< 累计 3D检测框提升 耗时(ms)
     double mdStageTotalPipeline= 0.0;  ///< 累计单帧全流程耗时(ms)
     double mdMaxWaitDetect     = 0.0;  ///< 单帧最大等待检测耗时(ms)
     // 当前帧的临时打点（由 GrabImage* 写入，UpdateFrameStatistics 读取）
     double mdCurOrbExtractMs   = 0.0;
     double mdCurWaitDetectMs   = 0.0;
+    double mdCurSemanticMs     = 0.0;
+    double mdCurSemVibrationMs = 0.0;
+    double mdCurSemDynamicMs   = 0.0;
+    double mdCurSemGroundMs    = 0.0;
+    double mdCurSemLiftMs      = 0.0;
 };
 
 } //namespace ORB_SLAM

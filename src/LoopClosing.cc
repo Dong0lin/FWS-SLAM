@@ -32,26 +32,45 @@
 namespace ORB_SLAM3
 {
 
-// 地图写操作的忙标志守卫：进入 CorrectLoop/MergeLocal/MergeLocal2 期间置 true，
-// 函数任何出口（含异常/提前return）自动复位。Tracking 侧全局尺度回拉据此判断
-// 是否有环回/合并正在改写地图，避免两线程并发暂停 LocalMapping 并并发改图。
-namespace {
-class LoopMapBusyGuard
+// 语义一致性打分（类别直方图余弦相似度，返回 [0,1]；任一侧空视野返回 1=不拦截）
+// 用于回环二次确认。与 KeyFrameDatabase 中的实现保持一致。
+static float SemanticConsistencyKF(const std::vector<int>& a, const std::vector<int>& b)
 {
-public:
-    explicit LoopMapBusyGuard(std::atomic<bool>& flag) : m_flag(flag) { m_flag.store(true); }
-    ~LoopMapBusyGuard() { m_flag.store(false); }
-private:
-    std::atomic<bool>& m_flag;
-};
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    for(size_t i = 0; i < a.size(); i++)
+    {
+        double ai = a[i], bi = b[i];
+        dot += ai * bi;
+        na += ai * ai;
+        nb += bi * bi;
+    }
+    if(na < 1e-6 || nb < 1e-6)
+        return 1.0f;
+    return (float)(dot / (std::sqrt(na) * std::sqrt(nb) + 1e-9));
+}
+
+// 尺度退化程度 deg∈[0,1]：由平面 λ（≈当前尺度/初始尺度）导出。
+//   λ>=0.95 视为健康 → deg=0（不改变原始行为）
+//   λ<=0.50 视为严重退化 → deg=1
+// λ 非法/未初始化（<=0）时返回 0，保证不干扰非平面/非单目场景。
+static float ScaleDegradationFromLambda(float lambda)
+{
+    const float kLambdaHealthy = 0.95f;
+    const float kLambdaSevere  = 0.50f;
+    if(!(lambda > 0.0f))
+        return 0.0f;
+    if(lambda >= kLambdaHealthy)
+        return 0.0f;
+    if(lambda <= kLambdaSevere)
+        return 1.0f;
+    return (kLambdaHealthy - lambda) / (kLambdaHealthy - kLambdaSevere);
 }
 
 LoopClosing::LoopClosing(Atlas *pAtlas, KeyFrameDatabase *pDB, ORBVocabulary *pVoc, const bool bFixScale, const bool bActiveLC):
     mbResetRequested(false), mbResetActiveMapRequested(false), mbFinishRequested(false), mbFinished(true), mpAtlas(pAtlas),
     mpKeyFrameDB(pDB), mpORBVocabulary(pVoc), mpMatchedKF(NULL), mLastLoopKFid(0), mbRunningGBA(false), mbFinishedGBA(true),
     mbStopGBA(false), mpThreadGBA(NULL), mbFixScale(bFixScale), mnFullBAIdx(0), mnLoopNumCoincidences(0), mnMergeNumCoincidences(0),
-    mbLoopDetected(false), mbMergeDetected(false), mnLoopNumNotFound(0), mnMergeNumNotFound(0), mbActiveLC(bActiveLC),
-    mbMapBusy(false)
+    mbLoopDetected(false), mbMergeDetected(false), mnLoopNumNotFound(0), mnMergeNumNotFound(0), mbActiveLC(bActiveLC)
 {
     mnCovisibilityConsistencyTh = 3;
     mpLastCurrentKF = static_cast<KeyFrame*>(NULL);
@@ -353,6 +372,13 @@ bool LoopClosing::NewDetectCommonRegions()
         mpLastMap = mpCurrentKF->GetMap();
     }
 
+    // ── 尺度退化感知（仅单目/平面可用时生效）──
+    // 平面 λ 反映全局尺度漂移程度；退化越重，回环作为唯一全局尺度纠正手段
+    // 应越积极被触发。这里只驱动"召回级"阈值，几何确认级阈值保持不变。
+    mfScaleDegradation = 0.0f;
+    if(mpLastMap != nullptr && mpLastMap->IsPlaneEstimated())
+        mfScaleDegradation = ScaleDegradationFromLambda(mpLastMap->GetPlaneScaleLambda());
+
     if(mpLastMap->IsInertial() && !mpLastMap->GetIniertialBA2())
     {
         mpKeyFrameDB->add(mpCurrentKF);
@@ -408,7 +434,7 @@ bool LoopClosing::NewDetectCommonRegions()
             mvpLoopMatchedMPs = vpMatchedMPs;
 
 
-            mbLoopDetected = mnLoopNumCoincidences >= 3;
+            mbLoopDetected = mnLoopNumCoincidences >= RequiredCoincidences();
             mnLoopNumNotFound = 0;
 
             if(!mbLoopDetected)
@@ -456,7 +482,7 @@ bool LoopClosing::NewDetectCommonRegions()
             mg2oMergeSlw = gScw;
             mvpMergeMatchedMPs = vpMatchedMPs;
 
-            mbMergeDetected = mnMergeNumCoincidences >= 3;
+            mbMergeDetected = mnMergeNumCoincidences >= RequiredCoincidences();
         }
         else
         {
@@ -503,7 +529,10 @@ bool LoopClosing::NewDetectCommonRegions()
 #ifdef REGISTER_TIMES
         std::chrono::steady_clock::time_point time_StartQuery = std::chrono::steady_clock::now();
 #endif
-        mpKeyFrameDB->DetectNBestCandidates(mpCurrentKF, vpLoopBowCand, vpMergeBowCand,3);
+        // 退化越重，候选数越多（3→7），并放宽共视词门槛；末端几何验证仍会把关。
+        const int nNumCandidates = 3 + (int)std::lround(mfScaleDegradation * 4.0f);
+        mpKeyFrameDB->DetectNBestCandidates(mpCurrentKF, vpLoopBowCand, vpMergeBowCand,
+                                            nNumCandidates, mfScaleDegradation);
 #ifdef REGISTER_TIMES
         std::chrono::steady_clock::time_point time_EndQuery = std::chrono::steady_clock::now();
 
@@ -791,6 +820,18 @@ bool LoopClosing::DetectCommonRegionsFromBoW(std::vector<KeyFrame*> &vpBowCand, 
                     {
                         g2o::Sim3 gSmw(pMostBoWMatchesKF->GetRotation().cast<double>(),pMostBoWMatchesKF->GetTranslation().cast<double>(),1.0);
                         g2o::Sim3 gScw = gScm*gSmw; // Similarity matrix of current from the world position
+
+                        // ── 尺度一致性闸门（单目等未固定尺度场景）──
+                        // 回环 Sim3 的尺度分量应接近 1（当前地图 vs 匹配地图，同为世界系）。
+                        // 极端偏离多为假匹配，或地图尺度已坏到回环也拉不回；此时宁可拒绝。
+                        // 该闸门与退化自适应解耦：退化越重，"召回"越积极但"确认"不放松。
+                        if(!mbFixScale)
+                        {
+                            const double sScale = gScw.scale();
+                            if(sScale < 0.5 || sScale > 2.0)
+                                continue;
+                        }
+
                         Sophus::Sim3f mScw = Converter::toSophus(gScw);
 
                         vector<MapPoint*> vpMatchedMP;
@@ -799,6 +840,59 @@ bool LoopClosing::DetectCommonRegionsFromBoW(std::vector<KeyFrame*> &vpBowCand, 
 
                         if(numProjOptMatches >= nProjOptMatches)
                         {
+                            // ── 语义二次确认（软门控）──
+                            // 几何(Sim3/重投影)验证已通过。BoW 分数已做过语义加权，
+                            // 此处仅对"语义极度不一致且双方语义目标都充足"的极端情况
+                            // 做保守剔除，避免假回环；低语义/普通差异场景不拦截。
+                            {
+                                const std::vector<int> vSemA = mpCurrentKF->GetSemanticSummary();
+                                const std::vector<int> vSemB = pKFi->GetSemanticSummary();
+                                int nSemA = 0, nSemB = 0;
+                                for(int v : vSemA) nSemA += v;
+                                for(int v : vSemB) nSemB += v;
+                                const int kMinSemCount = 3;
+                                if(nSemA >= kMinSemCount && nSemB >= kMinSemCount &&
+                                   SemanticConsistencyKF(vSemA, vSemB) < 0.2f)
+                                {
+                                    continue;   // 语义组成极端不一致 → 判为假回环
+                                }
+                            }
+
+                            // ── A1: 语义 inlier 逐点一致性（回环几何匹配的语义复核）──
+                            // 回环的 SearchByProjection 目前不做类别约束，匹配集里可能混入
+                            // "描述子误配到异类目标"的点，KF 级直方图无法发现这种点级混淆。
+                            // 这里在几何确认通过后，对逐点语义类做保守二次统计：
+                            //   nKnown   : 当前 KF 与地图点双方都有类别标签的匹配点
+                            //              (DYNAMIC 状态点排除，避免运动物体干扰)
+                            //   nConsist : 其中类别一致的
+                            // 仅在证据充足(>=8)且混淆比例过高(<0.5)时拦截，避免语义漏检误伤。
+                            {
+                                int nKnown = 0, nConsist = 0;
+                                for(size_t i = 0; i < vpMatchedMP.size(); i++)
+                                {
+                                    MapPoint* pMP = vpMatchedMP[i];
+                                    if(!pMP || pMP->isBad())
+                                        continue;
+                                    if(pMP->mFeatureStatus == MapPoint::DYNAMIC)
+                                        continue;
+                                    const int clsMP = pMP->mnSemanticClass;
+                                    if(clsMP < 0)
+                                        continue;
+                                    const int clsKP = mpCurrentKF->GetKeyPointSemanticClass((int)i);
+                                    if(clsKP < 0)      // 当前帧未观测到类别：漏检，不参与统计
+                                        continue;
+                                    nKnown++;
+                                    if(clsKP == clsMP)
+                                        nConsist++;
+                                }
+                                const int kMinKnownSemMatches = 8;
+                                if(nKnown >= kMinKnownSemMatches &&
+                                   (float)nConsist / (float)nKnown < 0.5f)
+                                {
+                                    continue;   // 类别混淆比例过高 → 判为假回环
+                                }
+                            }
+
                             int max_x = -1, min_x = 1000000;
                             int max_y = -1, min_y = 1000000;
                             for(MapPoint* pMPi : vpMatchedMP)
@@ -898,7 +992,7 @@ bool LoopClosing::DetectCommonRegionsFromBoW(std::vector<KeyFrame*> &vpBowCand, 
         vpMPs = vpBestMapPoints;
         vpMatchedMPs = vpBestMatchedMapPoints;
 
-        return nNumCoincidences >= 3;
+        return nNumCoincidences >= RequiredCoincidences();
     }
     else
     {
@@ -990,7 +1084,6 @@ int LoopClosing::FindMatchesByProjection(KeyFrame* pCurrentKF, KeyFrame* pMatche
 void LoopClosing::CorrectLoop()
 {
     //cout << "Loop detected!" << endl;
-    LoopMapBusyGuard mapBusyGuard(mbMapBusy);
 
     // Send a stop signal to Local Mapping
     // Avoid new keyframes are inserted while correcting the loop
@@ -1236,8 +1329,6 @@ void LoopClosing::CorrectLoop()
 
 void LoopClosing::MergeLocal()
 {
-    LoopMapBusyGuard mapBusyGuard(mbMapBusy);
-
     int numTemporalKFs = 25; //Temporal KFs in the local window if the map is inertial.
 
     //Relationship to rebuild the essential graph, it is used two times, first in the local window and later in the rest of the map
@@ -1807,7 +1898,6 @@ void LoopClosing::MergeLocal()
 void LoopClosing::MergeLocal2()
 {
     //cout << "Merge detected!!!!" << endl;
-    LoopMapBusyGuard mapBusyGuard(mbMapBusy);
 
     int numTemporalKFs = 11; //TODO (set by parameter): Temporal KFs in the local window if the map is inertial.
 
@@ -2087,55 +2177,6 @@ void LoopClosing::MergeLocal2()
     return;
 }
 
-void LoopClosing::CheckObservations(set<KeyFrame*> &spKFsMap1, set<KeyFrame*> &spKFsMap2)
-{
-    cout << "----------------------" << endl;
-    for(KeyFrame* pKFi1 : spKFsMap1)
-    {
-        map<KeyFrame*, int> mMatchedMP;
-        set<MapPoint*> spMPs = pKFi1->GetMapPoints();
-
-        for(MapPoint* pMPij : spMPs)
-        {
-            if(!pMPij || pMPij->isBad())
-            {
-                continue;
-            }
-
-            map<KeyFrame*, tuple<int,int>> mMPijObs = pMPij->GetObservations();
-            for(KeyFrame* pKFi2 : spKFsMap2)
-            {
-                if(mMPijObs.find(pKFi2) != mMPijObs.end())
-                {
-                    if(mMatchedMP.find(pKFi2) != mMatchedMP.end())
-                    {
-                        mMatchedMP[pKFi2] = mMatchedMP[pKFi2] + 1;
-                    }
-                    else
-                    {
-                        mMatchedMP[pKFi2] = 1;
-                    }
-                }
-            }
-
-        }
-
-        if(mMatchedMP.size() == 0)
-        {
-            cout << "CHECK-OBS: KF " << pKFi1->mnId << " has not any matched MP with the other map" << endl;
-        }
-        else
-        {
-            cout << "CHECK-OBS: KF " << pKFi1->mnId << " has matched MP with " << mMatchedMP.size() << " KF from the other map" << endl;
-            for(pair<KeyFrame*, int> matchedKF : mMatchedMP)
-            {
-                cout << "   -KF: " << matchedKF.first->mnId << ", Number of matches: " << matchedKF.second << endl;
-            }
-        }
-    }
-    cout << "----------------------" << endl;
-}
-
 
 void LoopClosing::SearchAndFuse(const KeyFrameAndPose &CorrectedPosesMap, vector<MapPoint*> &vpMapPoints)
 {
@@ -2292,10 +2333,6 @@ void LoopClosing::ResetIfRequested()
 
 void LoopClosing::RunGlobalBundleAdjustment(Map* pActiveMap, unsigned long nLoopKF)
 {  
-    // GBA 全程（优化+更新地图阶段）置忙：更新阶段会长时间持有 mMutexMapUpdate
-    // 并逐个改写KF/点，Tracking侧全局尺度回拉必须避开
-    LoopMapBusyGuard mapBusyGuard(mbMapBusy);
-
     Verbose::PrintMess("Starting Global Bundle Adjustment", Verbose::VERBOSITY_NORMAL);
 
 #ifdef REGISTER_TIMES

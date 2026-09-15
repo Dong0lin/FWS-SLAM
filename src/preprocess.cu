@@ -2,9 +2,10 @@
 #include "cuda_utils.h"
 #include "device_launch_parameters.h"
 
-// 静态全局变量，用于存储图像缓冲区
-static uint8_t* img_buffer_host = nullptr;   ///< 主机端固定内存缓冲区，用于高效数据传输
-static uint8_t* img_buffer_device = nullptr; ///< 设备端内存缓冲区，存储GPU上的图像数据
+// 图像缓冲区不再使用进程级静态全局变量：
+// 两个检测线程（左右目）并发调用 cuda_preprocess 时会互相覆盖同一块缓冲，
+// 导致推理输入偶尔变成另一只眼的图像 → 检测框位置偶发跳变。
+// 缓冲区改由调用方（每个 Detector 实例）持有并传入。
 
 /**
  * @brief 检查图像是否为灰度图像
@@ -203,6 +204,7 @@ __global__ void warpaffine_kernel(
 void cuda_preprocess(
     uint8_t* src, int src_width, int src_height,
     float* dst, int dst_width, int dst_height,
+    uint8_t* host_buf, uint8_t* dev_buf,
     cudaStream_t stream) {
 
     // 步骤0：检测并处理灰度图像
@@ -236,10 +238,10 @@ void cuda_preprocess(
     int img_size = processed_width * processed_height * 3;
     
     // 步骤1：将数据从CPU内存复制到GPU固定内存（零拷贝内存）
-    memcpy(img_buffer_host, processed_src, img_size);
+    memcpy(host_buf, processed_src, img_size);
     
     // 步骤2：异步将数据从固定内存传输到设备内存
-    CUDA_CHECK(cudaMemcpyAsync(img_buffer_device, img_buffer_host, img_size, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(dev_buf, host_buf, img_size, cudaMemcpyHostToDevice, stream));
 
     // 步骤3：计算仿射变换矩阵（保持宽高比的缩放）
     AffineMatrix s2d, d2s; // s2d: 源到目标，d2s: 目标到源
@@ -268,7 +270,7 @@ void cuda_preprocess(
 
     // 启动核函数进行并行处理
     warpaffine_kernel << <blocks, threads, 0, stream >> > (
-        img_buffer_device, processed_width * 3, processed_width,   // 源图像信息
+        dev_buf, processed_width * 3, processed_width,             // 源图像信息
         processed_height, dst, dst_width,                          // 目标图像信息
         dst_height, 128, d2s, jobs);                              // 处理参数（128为灰色填充值）
 
@@ -287,13 +289,13 @@ void cuda_preprocess(
  * 
  * @param max_image_size 最大支持的图像尺寸（像素数量）
  */
-void cuda_preprocess_init(int max_image_size) {
+void cuda_preprocess_init(uint8_t*& host_buf, uint8_t*& dev_buf, int max_image_size) {
     // 分配主机端固定内存（零拷贝内存，提高传输效率）
     // 分配三倍空间以支持彩色图像（即使输入是灰度图像，转换后也需要三通道）
-    CUDA_CHECK(cudaMallocHost((void**)&img_buffer_host, max_image_size * 3));
+    CUDA_CHECK(cudaMallocHost((void**)&host_buf, max_image_size * 3));
     
     // 分配设备端全局内存
-    CUDA_CHECK(cudaMalloc((void**)&img_buffer_device, max_image_size * 3));
+    CUDA_CHECK(cudaMalloc((void**)&dev_buf, max_image_size * 3));
 }
 
 /**
@@ -301,10 +303,10 @@ void cuda_preprocess_init(int max_image_size) {
  * 
  * 释放所有分配的GPU内存，避免内存泄漏
  */
-void cuda_preprocess_destroy() {
+void cuda_preprocess_destroy(uint8_t* host_buf, uint8_t* dev_buf) {
     // 释放设备端内存
-    CUDA_CHECK(cudaFree(img_buffer_device));
+    if(dev_buf) CUDA_CHECK(cudaFree(dev_buf));
     
     // 释放主机端固定内存
-    CUDA_CHECK(cudaFreeHost(img_buffer_host));
+    if(host_buf) CUDA_CHECK(cudaFreeHost(host_buf));
 }

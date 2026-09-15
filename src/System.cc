@@ -25,6 +25,7 @@
 #include <pangolin/pangolin.h>
 #include <opencv2/highgui/highgui.hpp>
 #include <iomanip>
+#include <map>
 #include <openssl/md5.h>
 #include <boost/serialization/base_object.hpp>
 #include <boost/serialization/string.hpp>
@@ -77,7 +78,13 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
     }
 
     cv::FileNode node = fsSettings["File.version"];
-    if(!node.empty() && node.isString() && node.string() == "1.0"){
+    bool bUseNewSettings = (!node.empty() && node.isString() && node.string() == "1.0");
+    // 长短焦（MF-SLAM 格式）yaml 没有 File.version，但带有 Camera.combine，
+    // 同样走新版 Settings 解析（新增的多焦距标定读取逻辑）
+    if(!bUseNewSettings && !fsSettings["Camera.combine"].empty())
+        bUseNewSettings = true;
+
+    if(bUseNewSettings){
         settings_ = new Settings(strSettingsFile,mSensor);
 
         mStrLoadAtlasFromFile = settings_->atlasLoadFile();
@@ -217,8 +224,27 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
     
     	//Initialize the Detection thread
 	mpDetector = new Detector();
-    mptDetector = new thread(&ORB_SLAM3::Detector::Run,mpDetector);
+	mptDetector = new thread(&ORB_SLAM3::Detector::Run,mpDetector);
 	mpDetector->SetTracker(mpTracker);
+
+    // 长短焦模式：右目（长焦）独立检测线程。
+    // 两个 Detector 各自拥有独立的 TensorRT context/stream/缓冲，可并行推理、
+    // 重叠占用 GPU（单线程顺序跑两次推理 GPU 利用率只有约 +30%）；
+    // 右目使用更小的立体模型（engine_path_stereo）。单目/普通双目不创建。
+    mpDetectorRight = nullptr;
+    mptDetectorRight = nullptr;
+    if(ORB_SLAM3::Frame::mbMultiFocal)
+    {
+        mpDetectorRight = new Detector(std::string(), true);   // 右目线程：立体小模型
+        mptDetectorRight = new thread(&ORB_SLAM3::Detector::Run, mpDetectorRight);
+        mpDetectorRight->SetTracker(mpTracker);
+        mpTracker->SetDetectorRight(mpDetectorRight);
+        cout << "[System] 长短焦模式：右目检测线程已启动（与左目并行）" << endl;
+    }
+
+    // 3D检测框默认开关：语义分层静态物体建图默认开启（单目/长短焦均可），
+    // 运行时可被 Viewer 菜单/接口切换
+    mpTracker->SetEnable3DBoxDetection(true);
 
     //Set pointers between threads
     mpTracker->SetLocalMapper(mpLocalMapper);
@@ -315,7 +341,7 @@ Sophus::SE3f System::TrackStereo(const cv::Mat &imLeft, const cv::Mat &imRight, 
         }
     }
     
-    mpTracker->GetImgForDetector(imLeftToFeed);
+    mpTracker->GetImgForDetector(imLeftToFeed, imRightToFeed);   // 双目：左+右同时送入检测线程
 
     if (mSensor == System::IMU_STEREO)
         for(size_t i_imu = 0; i_imu < vImuMeas.size(); i_imu++)
@@ -639,10 +665,14 @@ void System::Shutdown()
     mpLocalMapper->RequestFinish();
     mpLoopCloser->RequestFinish();
     mpDetector->RequestFinish();
+    if(mpDetectorRight)
+        mpDetectorRight->RequestFinish();
 
     // 等待检测线程真正退出（其 Run() 结束时会输出一次检测耗时统计）
     if(mptDetector && mptDetector->joinable())
         mptDetector->join();
+    if(mptDetectorRight && mptDetectorRight->joinable())
+        mptDetectorRight->join();
 
     // 先请求 Viewer 线程停止（必须在销毁 OpenCV/Pangolin 窗口之前完成）
     if(mpViewer)
@@ -707,14 +737,19 @@ bool System::isShutDown() {
 void System::SaveTrajectoryTUM(const string &filename)
 {
     cout << endl << "Saving camera trajectory to " << filename << " ..." << endl;
-    if(mSensor==MONOCULAR)
-    {
-        cerr << "ERROR: SaveTrajectoryTUM cannot be used for monocular." << endl;
-        return;
-    }
+
+    // 单目同样允许保存相机轨迹（mlpReferences/mlRelativeFramePoses 等对单目也会填充），
+    // 原 ORB-SLAM3 仅允许立体/RGBD；移除限制以支持单目语义 SLAM 的轨迹评估。
 
     vector<KeyFrame*> vpKFs = mpAtlas->GetAllKeyFrames();
     sort(vpKFs.begin(),vpKFs.end(),KeyFrame::lId);
+
+    // 无关键帧（SLAM 未初始化成功）时直接返回，避免越界
+    if (vpKFs.empty())
+    {
+        cerr << "WARNING: no keyframes, skip saving camera trajectory." << endl;
+        return;
+    }
 
     // Transform all keyframes so that the first keyframe is at the origin.
     // After a loop closure the first keyframe might not be at the origin.
@@ -1468,19 +1503,6 @@ double System::GetTimeFromIMUInit()
         return 0.f;
 }
 
-bool System::isLost()
-{
-    if (!mpAtlas->isImuInitialized())
-        return false;
-    else
-    {
-        if ((mpTracker->mState==Tracking::LOST)) //||(mpTracker->mState==Tracking::RECENTLY_LOST))
-            return true;
-        else
-            return false;
-    }
-}
-
 
 bool System::isFinished()
 {
@@ -1507,11 +1529,6 @@ float System::GetImageScale()
 }
 
 #ifdef REGISTER_TIMES
-void System::InsertRectTime(double& time)
-{
-    mpTracker->vdRectStereo_ms.push_back(time);
-}
-
 void System::InsertResizeTime(double& time)
 {
     mpTracker->vdResizeImage_ms.push_back(time);
@@ -1781,10 +1798,10 @@ void System::SavePersistentBoxesPLY(const string &filename)
     else
         N.normalize();
 
-    // 构建地面平面上的两个正交方向
+    // 世界固定基准（仅对未设置朝向的旧框兜底）
     Eigen::Vector3f ref = (std::abs(N.x()) < 0.9f) ? Eigen::Vector3f::UnitX() : Eigen::Vector3f::UnitZ();
-    Eigen::Vector3f U = N.cross(ref).normalized();
-    Eigen::Vector3f V = N.cross(U).normalized();
+    Eigen::Vector3f U0 = N.cross(ref).normalized();
+    Eigen::Vector3f V0 = N.cross(U0).normalized();
 
     // 每个 3D 框 8 个顶点 + 12 条棱线
     vector<Detection3D> vValid;
@@ -1831,6 +1848,19 @@ void System::SavePersistentBoxesPLY(const string &filename)
         float hd = box.depth  * 0.5f;
         Eigen::Vector3f c = box.center;   // 底面中心（在地面上）
 
+        // 有朝向的框：width 沿车宽方向（N×heading），depth 沿车长方向（heading）
+        Eigen::Vector3f U, V;
+        if(box.heading.squaredNorm() > 0.5f)
+        {
+            V = box.heading.normalized();
+            U = N.cross(V).normalized();
+        }
+        else
+        {
+            U = U0;
+            V = V0;
+        }
+
         // 底面 4 点
         Eigen::Vector3f corners[8];
         corners[0] = c - U*hw - V*hd;
@@ -1858,5 +1888,124 @@ void System::SavePersistentBoxesPLY(const string &filename)
     cout << vValid.size() << " persistent 3D boxes saved." << endl;
 }
 
-} //namespace ORB_SLAM
+// 按语义类别分层的 3D 框导出：每个类别一个 PLY 文件。
+// 复用 SavePersistentBoxesPLY 的顶点/棱线格式，仅按 class_id 拆分。
+void System::SavePersistentBoxesLayeredPLY(const string &filenamePrefix)
+{
+    Map* pActiveMap = mpAtlas->GetCurrentMap();
+    if(!pActiveMap)
+        return;
 
+    const vector<Detection3D>& vBoxes = pActiveMap->GetPersistentBoxes();
+    if(vBoxes.empty())
+    {
+        cout << "No persistent 3D boxes to save (layered)." << endl;
+        return;
+    }
+
+    Eigen::Vector3f N = pActiveMap->GetPlaneNormal();
+    if(N.norm() < 1e-6f)
+        N = Eigen::Vector3f(0.0f, 1.0f, 0.0f);
+    else
+        N.normalize();
+
+    Eigen::Vector3f ref = (std::abs(N.x()) < 0.9f) ? Eigen::Vector3f::UnitX() : Eigen::Vector3f::UnitZ();
+    Eigen::Vector3f U0 = N.cross(ref).normalized();
+    Eigen::Vector3f V0 = N.cross(U0).normalized();
+
+    const int edges[12][2] = {
+        {0,1},{1,2},{2,3},{3,0},   // 底面
+        {4,5},{5,6},{6,7},{7,4},   // 顶面
+        {0,4},{1,5},{2,6},{3,7}    // 竖棱
+    };
+
+    // 按类别分组（仅导出车辆类 2~9，行人/人群不导出——人通常动态且不稳定）
+    std::map<int, vector<Detection3D>> mByClass;
+    for(const Detection3D& box : vBoxes)
+    {
+        if(!box.bValid) continue;
+        if(box.class_id < 2 || box.class_id > 9) continue;
+        mByClass[box.class_id].push_back(box);
+    }
+
+    int nTotal = 0;
+    for(const auto& kv : mByClass)
+    {
+        const int cid = kv.first;
+        const vector<Detection3D>& vValid = kv.second;
+        if(vValid.empty()) continue;
+
+        std::string clsName = (cid < (int)CLASS_NAMES.size()) ? CLASS_NAMES[cid] : ("class" + std::to_string(cid));
+        std::string filename = filenamePrefix + "_" + clsName + ".ply";
+        cout << "Saving layered boxes [" << clsName << "] (" << vValid.size() << ") to " << filename << " ..." << endl;
+
+        unsigned int r = 255, g = 255, b = 255;
+        if(cid < (int)COLORS.size()) { r = COLORS[cid][0]; g = COLORS[cid][1]; b = COLORS[cid][2]; }
+
+        ofstream f(filename.c_str());
+        if(!f.is_open())
+        {
+            cerr << "ERROR: cannot open file " << filename << " for writing." << endl;
+            continue;
+        }
+
+        f << "ply" << endl;
+        f << "format ascii 1.0" << endl;
+        f << "comment ORB-SLAM3 semantic layered 3D boxes: " << clsName << endl;
+        f << "element vertex " << (vValid.size() * 8) << endl;
+        f << "property float x" << endl;
+        f << "property float y" << endl;
+        f << "property float z" << endl;
+        f << "property uchar red" << endl;
+        f << "property uchar green" << endl;
+        f << "property uchar blue" << endl;
+        f << "element edge " << (vValid.size() * 12) << endl;
+        f << "property int vertex1" << endl;
+        f << "property int vertex2" << endl;
+        f << "end_header" << endl;
+
+        for(const Detection3D& box : vValid)
+        {
+            float hw = box.width * 0.5f;
+            float hd = box.depth * 0.5f;
+            Eigen::Vector3f c = box.center;
+
+            Eigen::Vector3f U, V;
+            if(box.heading.squaredNorm() > 0.5f)
+            {
+                V = box.heading.normalized();
+                U = N.cross(V).normalized();
+            }
+            else
+            {
+                U = U0;
+                V = V0;
+            }
+
+            Eigen::Vector3f corners[8];
+            corners[0] = c - U*hw - V*hd;
+            corners[1] = c + U*hw - V*hd;
+            corners[2] = c + U*hw + V*hd;
+            corners[3] = c - U*hw + V*hd;
+            for(int i = 0; i < 4; i++)
+                corners[i+4] = corners[i] + N * box.height;
+
+            for(int i = 0; i < 8; i++)
+                f << setprecision(7) << corners[i](0) << " " << corners[i](1) << " " << corners[i](2)
+                  << " " << r << " " << g << " " << b << endl;
+        }
+
+        for(size_t k = 0; k < vValid.size(); k++)
+        {
+            int base = static_cast<int>(k) * 8;
+            for(int e = 0; e < 12; e++)
+                f << (base + edges[e][0]) << " " << (base + edges[e][1]) << endl;
+        }
+
+        f.close();
+        nTotal += (int)vValid.size();
+    }
+    cout << nTotal << " semantic 3D boxes saved in layered files." << endl;
+}
+
+} //namespace ORB_SLAM

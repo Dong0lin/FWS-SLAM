@@ -92,6 +92,9 @@ KeyFrame::KeyFrame(Frame &F, Map *pMap, KeyFrameDatabase *pKFDB):
     mImuBias = F.mImuBias;
     SetPose(F.GetPose());
 
+    // 逐关键点语义类别（回环语义 inlier 一致性判据用）；此时 Frame 已完成分类
+    mvKeypointSemanticClass = F.mvKeypointSemanticClass;
+
     mnOriginMapId = pMap->GetId();
 }
 
@@ -279,19 +282,6 @@ int KeyFrame::GetWeight(KeyFrame *pKF)
         return mConnectedKeyFrameWeights[pKF];
     else
         return 0;
-}
-
-int KeyFrame::GetNumberMPs()
-{
-    unique_lock<mutex> lock(mMutexFeatures);
-    int numberMPs = 0;
-    for(size_t i=0, iend=mvpMapPoints.size(); i<iend; i++)
-    {
-        if(!mvpMapPoints[i])
-            continue;
-        numberMPs++;
-    }
-    return numberMPs;
 }
 
 void KeyFrame::AddMapPoint(MapPoint *pMP, const size_t &idx)
@@ -542,10 +532,16 @@ void KeyFrame::AddMergeEdge(KeyFrame* pKF)
     mspMergeEdges.insert(pKF);
 }
 
-set<KeyFrame*> KeyFrame::GetMergeEdges()
+void KeyFrame::SetSemanticSummary(const std::vector<int>& cnt)
 {
-    unique_lock<mutex> lockCon(mMutexConnections);
-    return mspMergeEdges;
+    unique_lock<mutex> lock(mMutexFeatures);
+    mvSemanticSummary = cnt;
+}
+
+std::vector<int> KeyFrame::GetSemanticSummary()
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    return mvSemanticSummary;
 }
 
 void KeyFrame::SetNotErase()
@@ -1071,40 +1067,6 @@ bool KeyFrame::ProjectPointDistort(MapPoint* pMP, cv::Point2f &kp, float &u, flo
     return true;
 }
 
-bool KeyFrame::ProjectPointUnDistort(MapPoint* pMP, cv::Point2f &kp, float &u, float &v)
-{
-
-    // 3D in absolute coordinates
-    Eigen::Vector3f P = pMP->GetWorldPos();
-
-    // 3D in camera coordinates
-    Eigen::Vector3f Pc = mRcw * P + mTcw.translation();
-    float &PcX = Pc(0);
-    float &PcY= Pc(1);
-    float &PcZ = Pc(2);
-
-    // Check positive depth
-    if(PcZ<0.0f)
-    {
-        cout << "Negative depth: " << PcZ << endl;
-        return false;
-    }
-
-    // Project in image and check it is not outside
-    const float invz = 1.0f/PcZ;
-    u = fx * PcX * invz + cx;
-    v = fy * PcY * invz + cy;
-
-    if(u<mnMinX || u>mnMaxX)
-        return false;
-    if(v<mnMinY || v>mnMaxY)
-        return false;
-
-    kp = cv::Point2f(u, v);
-
-    return true;
-}
-
 Sophus::SE3f KeyFrame::GetRelativePoseTrl()
 {
     unique_lock<mutex> lock(mMutexPose);
@@ -1133,17 +1095,6 @@ Eigen::Vector3f KeyFrame::GetRightCameraCenter() {
     unique_lock<mutex> lock(mMutexPose);
 
     return (mTwc * mTlr).translation();
-}
-
-Eigen::Matrix<float,3,3> KeyFrame::GetRightRotation() {
-    unique_lock<mutex> lock(mMutexPose);
-
-    return (mTrl.so3() * mTcw.so3()).matrix();
-}
-
-Eigen::Vector3f KeyFrame::GetRightTranslation() {
-    unique_lock<mutex> lock(mMutexPose);
-    return (mTrl * mTcw).translation();
 }
 
 void KeyFrame::SetORBVocabulary(ORBVocabulary* pORBVoc)

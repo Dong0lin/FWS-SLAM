@@ -67,13 +67,10 @@ public:
     void clear();
     void clearMap(Map* pMap);
 
-    // Loop Detection(DEPRECATED)
-    std::vector<KeyFrame *> DetectLoopCandidates(KeyFrame* pKF, float minScore);
-
     // Loop and Merge Detection
-    void DetectCandidates(KeyFrame* pKF, float minScore,vector<KeyFrame*>& vpLoopCand, vector<KeyFrame*>& vpMergeCand);
-    void DetectBestCandidates(KeyFrame *pKF, vector<KeyFrame*> &vpLoopCand, vector<KeyFrame*> &vpMergeCand, int nMinWords);
-    void DetectNBestCandidates(KeyFrame *pKF, vector<KeyFrame*> &vpLoopCand, vector<KeyFrame*> &vpMergeCand, int nNumCandidates);
+    // fSearchAggressiveness∈[0,1]: 尺度退化程度，越大越放宽"召回级"门槛
+    // （共视词最小公共词数）。默认 0 → 行为与原始一致。
+    void DetectNBestCandidates(KeyFrame *pKF, vector<KeyFrame*> &vpLoopCand, vector<KeyFrame*> &vpMergeCand, int nNumCandidates, float fSearchAggressiveness = 0.0f);
 
     // Relocalization
     std::vector<KeyFrame*> DetectRelocalizationCandidates(Frame* F, Map* pMap);

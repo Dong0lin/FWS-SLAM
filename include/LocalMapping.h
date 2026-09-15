@@ -78,7 +78,6 @@ public:
 
     bool IsInitializing();
     double GetCurrKFTime();
-    KeyFrame* GetCurrKF();
 
     std::mutex mMutexImuInit;
 

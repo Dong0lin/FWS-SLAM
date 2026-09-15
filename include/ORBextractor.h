@@ -56,10 +56,23 @@ public:
     // Mask is ignored in the current implementation.
     int operator()( cv::InputArray _image, cv::InputArray _mask,
                     std::vector<cv::KeyPoint>& _keypoints,
-                    cv::OutputArray _descriptors, std::vector<int> &vLappingArea);
+                    cv::OutputArray _descriptors, std::vector<int> &vLappingArea,
+                    int FLAG = -1);
+
+    // 长短焦焦距比（右fx/左fx）与左图重叠视场ROI，由 Frame::SetMultiFocalCalib 设置，
+    // 在构造特征提取器之前生效（ROI 内加密提取、跳过无法匹配的低层金字塔）
+    static float msFocalScale;
+    static void SetFocalScale(float fScale) { msFocalScale = fScale; }
+    static cv::Point2f msROILeftUp, msROIRightBottom;   // 左图重叠视场ROI（原始图像坐标）
+    static void SetROI(const cv::Point2f& lu, const cv::Point2f& rb) { msROILeftUp = lu; msROIRightBottom = rb; }
+    static cv::Point2f msROIRectLeftUp, msROIRectRightBottom;   // 校正坐标系下的重叠视场ROI
+    static void SetRectifiedROI(const cv::Point2f& lu, const cv::Point2f& rb) { msROIRectLeftUp = lu; msROIRectRightBottom = rb; }
 
     int inline GetLevels(){
         return nlevels;}
+
+    int inline GetMaxFeatures(){
+        return nfeatures;}
 
     float inline GetScaleFactor(){
         return scaleFactor;}
@@ -85,9 +98,14 @@ public:
 protected:
 
     void ComputePyramid(cv::Mat image);
-    void ComputeKeyPointsOctTree(std::vector<std::vector<cv::KeyPoint> >& allKeypoints);    
+    void ComputeKeyPointsOctTree(std::vector<std::vector<cv::KeyPoint> >& allKeypoints, const int FLAG = -1);
     std::vector<cv::KeyPoint> DistributeOctTree(const std::vector<cv::KeyPoint>& vToDistributeKeys, const int &minX,
                                            const int &maxX, const int &minY, const int &maxY, const int &nFeatures, const int &level);
+
+    // 长短焦模式：ROI（重叠视场）内保留每个节点的最大+次大响应点，ROI 外保留最大值
+    std::vector<cv::KeyPoint> JinLnDistributeOctTree(const std::vector<cv::KeyPoint>& vToDistributeKeys, const int &minX,
+                                               const int &maxX, const int &minY, const int &maxY,
+                                               const int &nFeatures, const int &level, const int &flag);
 
     void ComputeKeyPointsOld(std::vector<std::vector<cv::KeyPoint> >& allKeypoints);
     std::vector<cv::Point> pattern;
@@ -111,4 +129,3 @@ protected:
 } //namespace ORB_SLAM
 
 #endif
-

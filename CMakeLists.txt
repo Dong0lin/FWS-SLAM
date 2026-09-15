@@ -27,8 +27,10 @@ MESSAGE("Build type: " ${CMAKE_BUILD_TYPE})
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}  -Wall   -O3")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall   -O3")
-set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -march=native")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")
+# -march=native 放基础选项（而不是只放 Release）：
+# 否则 Debug 配置下会丢失该优化，单目等重计算路径速度下降约 10%（29fps→26fps）
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=native")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
 
 # 设置CUDA编译选项（参考yolov11.txt）
 set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -gencode arch=compute_61,code=sm_61")
@@ -109,9 +111,25 @@ else()
         message(WARNING "libcudart not found by find_library; linking may fail. You can set CUDART_LIBRARY manually.")
 endif()
 
+# CUDA 根目录（TensorRT 插件头文件/库搜索用）
+# 优先取环境变量 CUDA_ROOT → CUDAToolkit → 常见安装位置
+if(DEFINED ENV{CUDA_ROOT})
+        set(CUDA_ROOT "$ENV{CUDA_ROOT}")
+elseif(CUDAToolkit_FOUND)
+        set(CUDA_ROOT "${CUDAToolkit_TARGET_DIR}")
+elseif(EXISTS "/usr/local/cuda")
+        set(CUDA_ROOT "/usr/local/cuda")
+endif()
 
-# 手动指定TensorRT的安装路径（替换为你的实际路径）
-set(TENSORRT_ROOT "/home/dl/TensorRT/TensorRT-8.6.0.12")
+
+# TensorRT 安装路径：优先取环境变量 TENSORRT_ROOT，否则用下面的默认值
+# 可用 `cmake -DTENSORRT_ROOT=/path/to/TensorRT ..` 覆盖
+if(DEFINED ENV{TENSORRT_ROOT})
+        set(_TENSORRT_DEFAULT "$ENV{TENSORRT_ROOT}")
+else()
+        set(_TENSORRT_DEFAULT "/home/dl/TensorRT/TensorRT-8.6.0.12")
+endif()
+set(TENSORRT_ROOT "${_TENSORRT_DEFAULT}" CACHE PATH "TensorRT root directory")
 
 # 添加TensorRT头文件目录（确保包含NvInferRuntimeCommon.h）
 include_directories(${TENSORRT_ROOT}/include)
@@ -229,9 +247,11 @@ ${CUDART_LIBRARY}
 
 # YOLOX---------------------------------------------------------------------------------------------------------------------------------
 # cuda
- include_directories(/usr/local/cuda-11.6/targets/x86_64-linux/include)
- link_directories(/usr/local/cuda-11.6/targets/x86_64-linux/lib)
- 
+if(CUDA_ROOT)
+        include_directories(${CUDA_ROOT}/include)
+        link_directories(${CUDA_ROOT}/lib)
+endif()
+
 #------------------------------------------------------------------------------------------------------------------------------------------
 
 # 打印TensorRT头文件路径（用于调试）
@@ -273,6 +293,14 @@ add_executable(stereo_kitti
         Examples/Stereo/stereo_kitti.cc)
 target_link_libraries(stereo_kitti ${PROJECT_NAME})
 
+add_executable(stereo_multifocal
+        Examples/Stereo/stereo_multifocal.cc)
+target_link_libraries(stereo_multifocal ${PROJECT_NAME})
+
+add_executable(stereo_mf_verify
+        Examples/Stereo/mf_verify.cc)
+target_link_libraries(stereo_mf_verify ${PROJECT_NAME})
+
 add_executable(stereo_euroc
         Examples/Stereo/stereo_euroc.cc)
 target_link_libraries(stereo_euroc ${PROJECT_NAME})
@@ -281,15 +309,15 @@ add_executable(stereo_tum_vi
         Examples/Stereo/stereo_tum_vi.cc)
 target_link_libraries(stereo_tum_vi ${PROJECT_NAME})
 
-if(realsense2_FOUND)
-    add_executable(stereo_realsense_t265
-            Examples/Stereo/stereo_realsense_t265.cc)
-    target_link_libraries(stereo_realsense_t265 ${PROJECT_NAME})
+# if(realsense2_FOUND)
+#     add_executable(stereo_realsense_t265
+#             Examples/Stereo/stereo_realsense_t265.cc)
+#     target_link_libraries(stereo_realsense_t265 ${PROJECT_NAME})
 
-    add_executable(stereo_realsense_D435i
-            Examples/Stereo/stereo_realsense_D435i.cc)
-    target_link_libraries(stereo_realsense_D435i ${PROJECT_NAME})
-endif()
+#     add_executable(stereo_realsense_D435i
+#             Examples/Stereo/stereo_realsense_D435i.cc)
+#     target_link_libraries(stereo_realsense_D435i ${PROJECT_NAME})
+# endif()
 
 
 
@@ -324,6 +352,11 @@ add_executable(slam_runner
         Examples/Monocular/slam_runner.cc)
 target_link_libraries(slam_runner ${PROJECT_NAME} rt)
 
+# 双目/长短焦 Qt 界面 runner（独立于单目 slam_runner）
+add_executable(slam_runner_stereo
+        Examples/Stereo/slam_runner_stereo.cc)
+target_link_libraries(slam_runner_stereo ${PROJECT_NAME} rt)
+
 add_executable(mono_tum_vi
         Examples/Monocular/mono_tum_vi.cc)
 target_link_libraries(mono_tum_vi ${PROJECT_NAME})
@@ -332,15 +365,15 @@ target_link_libraries(mono_tum_vi ${PROJECT_NAME})
 #         Examples/Monocular/myvideo2.cc)
 # target_link_libraries(myvideo2 ${PROJECT_NAME})
 
-if(realsense2_FOUND)
-    add_executable(mono_realsense_t265
-            Examples/Monocular/mono_realsense_t265.cc)
-    target_link_libraries(mono_realsense_t265 ${PROJECT_NAME})
+# if(realsense2_FOUND)
+#     add_executable(mono_realsense_t265
+#             Examples/Monocular/mono_realsense_t265.cc)
+#     target_link_libraries(mono_realsense_t265 ${PROJECT_NAME})
 
-    add_executable(mono_realsense_D435i
-            Examples/Monocular/mono_realsense_D435i.cc)
-    target_link_libraries(mono_realsense_D435i ${PROJECT_NAME})
-endif()
+#     add_executable(mono_realsense_D435i
+#             Examples/Monocular/mono_realsense_D435i.cc)
+#     target_link_libraries(mono_realsense_D435i ${PROJECT_NAME})
+# endif()
 
 # #Monocular inertial examples
 

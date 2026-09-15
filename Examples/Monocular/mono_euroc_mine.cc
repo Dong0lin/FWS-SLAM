@@ -70,7 +70,7 @@ int main(int argc, char **argv)
     for (seq = 0; seq<num_seq; seq++)
     {
         cout << "Loading images for sequence " << seq << "...";
-        LoadImages(string(argv[(2*seq)+3]) + "/mav0/cam0/data", string(argv[(2*seq)+4]), vstrImageFilenames[seq], vTimestampsCam[seq]);
+        LoadImages(string(argv[(2*seq)+3]) + "/cam0/data", string(argv[(2*seq)+4]), vstrImageFilenames[seq], vTimestampsCam[seq]);
         cout << "LOADED!" << endl;
 
         nImages[seq] = vstrImageFilenames[seq].size();
@@ -88,7 +88,17 @@ int main(int argc, char **argv)
     int fps = 60;
     float dT = 1.f/fps;
     // Create SLAM system. It initializes all system threads and gets ready to process frames.
-    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::MONOCULAR, ORB_SLAM3::System::VIEWER_PANGOLIN);
+    // Viewer 类型可用环境变量 SLAM_VIEWER 覆盖（0=无, 1=Pangolin, 2=Qt），默认 Pangolin。
+    // 无显示环境（如离线评测机）设 SLAM_VIEWER=0 即可正常跑。
+    ORB_SLAM3::System::eViewerType viewerType = ORB_SLAM3::System::VIEWER_PANGOLIN;
+    if(const char* envViewer = std::getenv("SLAM_VIEWER"))
+        viewerType = (ORB_SLAM3::System::eViewerType)atoi(envViewer);
+    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::MONOCULAR, viewerType);
+
+    // 质量日志：默认关闭；加 --save-quality 参数开启（每30帧采样）
+    for(int i = 0; i < argc; i++)
+        if(std::string(argv[i]) == "--save-quality")
+            SLAM.GetTracker()->SetSaveQuality(true);
     float imageScale = SLAM.GetImageScale();
 
     double t_resize = 0.f;

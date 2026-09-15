@@ -103,8 +103,6 @@ public:
 
     Sophus::SE3f GetRelativePoseTrl();
     Sophus::SE3f GetRelativePoseTlr();
-    Eigen::Matrix3f GetRelativePoseTlr_rotation();
-    Eigen::Vector3f GetRelativePoseTlr_translation();
 
     void SetNewBias(const IMU::Bias &b);
 
@@ -114,8 +112,6 @@ public:
 
     bool ProjectPointDistort(MapPoint* pMP, cv::Point2f &kp, float &u, float &v);
 
-    Eigen::Vector3f inRefCoordinates(Eigen::Vector3f pCw);
-
     // Compute the cell of a keypoint (return false if outside the grid)
     bool PosInGrid(const cv::KeyPoint &kp, int &posX, int &posY);
 
@@ -124,6 +120,47 @@ public:
     // Search a match for each keypoint in the left image to a keypoint in the right image.
     // If there is a match, depth is computed and the right coordinate associated to the left keypoint is stored.
     void ComputeStereoMatches();
+
+    // ------------------------------------------------------------------
+    // 长短焦（Multi-focal）双目：特征点校正 + 焦距比补偿匹配
+    // 移植自 MF-SLAM（undistComputeStereoMatches）
+    // ------------------------------------------------------------------
+    void UndistortLeftKeyPoints();
+    void UndistortRightKeyPoints();
+    void undistComputeStereoMatches();
+
+    // 长短焦标定（由 Tracking::newParameterLoader 从 Settings 设置一次）
+    static bool mbMultiFocal;
+    static cv::Mat mLeftK, mLeftD, mLeftR, mLeftP;
+    static cv::Mat mRightK, mRightD, mRightR, mRightP;
+    static float mFscale;                  // 焦距比 Rfx/fx
+    static float mInvFscale;
+    static cv::Point2f mROILeftUp, mROIRightBottom;          // 左图（原始图像坐标）重叠视场ROI（提取/显示用）
+    static cv::Point2f mROIRectLeftUp, mROIRectRightBottom;  // 校正坐标系下的重叠视场ROI（匹配门控用）
+    static float mMinDepth, mMaxDepth;       // 立体深度合理性门控（假近点/假远点过滤）
+    static bool mbGateAboveCamera;           // 扑翼航拍场景：特征方向不可能指向相机上方（校正坐标 v<cy 即上方）
+    static float mAboveCameraGate;           // 相机上方超视界门控（米）：与 MaxDepth 解耦，固定 ~100m（见 SetMultiFocalCalib）
+    static float mBelowPrincipalGate;        // 主点下方超远门控（米）：45°俯视下主点下方(v>cy)地面最远~50m，>60m 必为假匹配
+
+    // 长焦对应区域自适应精化（前 ROIFINALIZE_FRAMES 帧扩大匹配范围，
+    // 用实际匹配特征点的分布重新划分重叠区域，替代纯标定初始区域）
+    // 注意：当前弃用（SetMultiFocalCalib 中 mbROIAdapting 置 false），
+    // 使用标定固定区域；自适应代码保留，需要时置 true 重新启用。
+    static bool mbROIAdapting;               // 自适应期间：匹配门控放宽到全图，同时累积匹配点
+    static int mnROIAdaptFrameCount;         // 已累积帧数
+    static std::vector<cv::Point2f> mvsROIMatchPts;   // 累积的匹配特征点（校正坐标）
+    static const int ROIFINALIZE_FRAMES = 100;
+    static void RefineROIFromMatches();      // 用累积匹配点分位数+边距重划 ROI（校正+原始坐标）
+    static void SetMultiFocalCalib(const cv::Mat& leftK, const cv::Mat& leftD, const cv::Mat& leftR, const cv::Mat& leftP,
+                                   const cv::Mat& rightK, const cv::Mat& rightD, const cv::Mat& rightR, const cv::Mat& rightP,
+                                   float fScale, const cv::Point2f& roiLU, const cv::Point2f& roiRB,
+                                   const int imW, const int imH, const float minDepth, const float maxDepth);
+    static void ResetMultiFocalCalib();
+
+    // 把检测框从原始左图坐标变换到校正坐标（用于语义/动态点管线与校正后特征点对齐）
+    static void RectifyDetectionBoxes(std::vector<Detection>& vBoxes);
+    // 把检测框从原始右图坐标变换到校正坐标（左右目检测框匹配用）
+    static void RectifyDetectionBoxesRight(std::vector<Detection>& vBoxes);
 
     // Associate a "right" coordinate to a keypoint if there is valid depth in the depthmap.
     void ComputeStereoFromRGBD(const cv::Mat &imDepth);
@@ -235,12 +272,17 @@ public:
     // In the RGB-D case, RGB images can be distorted.
     std::vector<cv::KeyPoint> mvKeys, mvKeysRight;
     std::vector<cv::KeyPoint> mvKeysUn;
+    std::vector<cv::KeyPoint> mvKeysRightUn;
+    std::vector<cv::KeyPoint> refermvKeys, refermvKeysRight;  // 校正前的原始关键点（SAD精匹配/可视化用）
 
     // Corresponding stereo coordinate and depth for each keypoint.
     std::vector<MapPoint*> mvpMapPoints;
     // "Monocular" keypoints have a negative value.
     std::vector<float> mvuRight;
+    std::vector<float> mvuLeft;
     std::vector<float> mvDepth;
+    std::vector<float> LeftIdtoRightId;   // 左特征点对应右特征点ID
+    std::vector<float> RightIdToLeftId;   // 右特征点对应左特征点ID
 
     // Bag of Words Vector structures.
     DBoW2::BowVector mBowVec;
@@ -340,9 +382,15 @@ public:
 //    std::vector<cv::Rect> detectedBoxes;
     std::vector<Detection> detectedBoxes_dynamic;
     std::vector<Detection> detectedBoxes;
+    // 左右目检测框匹配（长短焦模式，仅非人目标）：detectedBoxes[i]（左目校正坐标）
+    // 匹配到右目检测框 objectsRight[mvMatchedRightBoxIdx[i]]（右目原始坐标），-1=未匹配。
+    // 深度取左目框内已立体匹配特征点的中位深度（50m 高空下框中心视差常不足 1px，不可靠）。
+    std::vector<int> mvMatchedRightBoxIdx;
+    std::vector<float> mvDetectionDepth;
     // std::vector<cv::Rect> detectedBoxes_half;
 //    std::vector<cv::Rect> detectedBoxes_stay;
     void SetBoxes(const std::vector<Detection>& newBoxes);
+    void MatchRightDetections(const std::vector<Detection>& vRightBoxes);
 
     // 语义分类：每帧在 SetBoxes() 时预计算，O(1) 查询
     std::vector<int> mvKeypointSemanticClass;   // 每个关键点的语义类别（-1=非语义）

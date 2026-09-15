@@ -65,6 +65,7 @@ protected:
     vector<bool> mvbMap, mvbVO;
     bool mbOnlyTracking;
     bool mbQtMode = false;
+    bool mbShowDynamicVis = false;   // 动态一致性模式：仅显示语义点+检测框，不叠加 ORB 特征点
     int mnTracked, mnTrackedVO;
     vector<cv::KeyPoint> mvIniKeys;
     vector<int> mvIniMatches;

@@ -182,8 +182,6 @@ public:
     Map* GetMap();
     void UpdateMap(Map* pMap);
 
-    void PrintObservations();
-
     void PreSave(set<KeyFrame*>& spKF,set<MapPoint*>& spMP);
     void PostLoad(map<long unsigned int, KeyFrame*>& mpKFid, map<long unsigned int, MapPoint*>& mpMPid);
 

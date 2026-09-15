@@ -251,9 +251,23 @@ void MapDrawer::DrawPlane()
     Eigen::Vector3f U = N.cross(ref).normalized();
     Eigen::Vector3f V = N.cross(U).normalized();
 
-    // 面片半径：随相机高度扩大（确保始终覆盖视野）
+    // 面片半径：先随相机高度扩大确保覆盖视野，
+    // 再扩展到已建图区域（关键帧在平面上的投影分布范围）。
+    // 长短焦模式地图尺度大（轨迹跨度大），单按相机高度的面片会显得太小；
+    // 用关键帧分布做上界，尺度多大面片就多大。
     float camHeight = std::abs(N.dot(camCenter) - d);
     float radius = std::max(camHeight * 4.0f, 50.0f);
+    {
+        const std::vector<KeyFrame*>& vpKFs = pActiveMap->GetAllKeyFrames();
+        for(KeyFrame* pKF : vpKFs)
+        {
+            if(!pKF || pKF->isBad()) continue;
+            Eigen::Vector3f kfProj = pKF->GetCameraCenter() - N * (N.dot(pKF->GetCameraCenter()) - d);
+            float dist = (kfProj - camProj).norm();
+            if(dist > radius) radius = dist;
+        }
+        radius *= 1.3f;   // 留 30% 边距
+    }
 
     // 细分网格
     const int steps = 40;
@@ -329,9 +343,10 @@ void MapDrawer::DrawDetection3Ds()
     if(boxes.empty()) return;
 
     const Eigen::Vector3f& N = pMap->GetPlaneNormal();
+    // 世界固定基准（仅对未设置朝向的旧框兜底）
     Eigen::Vector3f ref = (std::abs(N.x()) < 0.9f) ? Eigen::Vector3f::UnitX() : Eigen::Vector3f::UnitZ();
-    Eigen::Vector3f U = N.cross(ref).normalized();
-    Eigen::Vector3f V = N.cross(U).normalized();
+    Eigen::Vector3f U0 = N.cross(ref).normalized();
+    Eigen::Vector3f V0 = N.cross(U0).normalized();
 
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -346,8 +361,20 @@ void MapDrawer::DrawDetection3Ds()
         float g = COLORS[ci][1] / 255.0f;
         float b = COLORS[ci][2] / 255.0f;
 
-        Eigen::Vector3f hU = U * (box.width * 0.5f);
-        Eigen::Vector3f hV = V * (box.depth * 0.5f);
+        // 有朝向的框：width 沿车宽方向（N×heading），depth 沿车长方向（heading）
+        Eigen::Vector3f hU, hV;
+        if(box.heading.squaredNorm() > 0.5f)
+        {
+            Eigen::Vector3f V = box.heading.normalized();
+            Eigen::Vector3f U = N.cross(V).normalized();
+            hU = U * (box.width * 0.5f);
+            hV = V * (box.depth * 0.5f);
+        }
+        else
+        {
+            hU = U0 * (box.width * 0.5f);
+            hV = V0 * (box.depth * 0.5f);
+        }
         Eigen::Vector3f up  = N * box.height;
 
         Eigen::Vector3f b1 = box.center - hU - hV;

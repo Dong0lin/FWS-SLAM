@@ -189,6 +189,10 @@ public:
     // Save persistent 3D detection boxes as PLY (with class colors from common.h)
     void SavePersistentBoxesPLY(const string &filename);
 
+    // Save semantic 3D boxes as layered PLY: one file per semantic category
+    // (vehicles / pedestrians / etc.), filename = prefix + "_" + classname + ".ply"
+    void SavePersistentBoxesLayeredPLY(const string &filenamePrefix);
+
     // Information from most recent processed frame
     // You can call this right after TrackMonocular (or stereo or RGBD)
     int GetTrackingState();
@@ -197,7 +201,6 @@ public:
 
     // For debugging
     double GetTimeFromIMUInit();
-    bool isLost();
     bool isFinished();
 
     void ChangeDataset();
@@ -210,7 +213,6 @@ public:
     Tracking*    GetTracker()     { return mpTracker; }
 
 #ifdef REGISTER_TIMES
-    void InsertRectTime(double& time);
     void InsertResizeTime(double& time);
     void InsertTrackTime(double& time);
 #endif
@@ -255,6 +257,7 @@ private:
     
     	// DETECTOR
     Detector* mpDetector;
+    Detector* mpDetectorRight;          // 右目（长焦）独立检测线程（仅长短焦模式）
 
     // System threads: Local Mapping, Loop Closing, Viewer.
     // The Tracking thread "lives" in the main execution thread that creates the System object.
@@ -262,6 +265,7 @@ private:
     std::thread* mptLoopClosing;
     std::thread* mptViewer;
     	std::thread* mptDetector;
+    std::thread* mptDetectorRight;      // 右目检测线程句柄
 
     // Reset flag
     std::mutex mMutexReset;

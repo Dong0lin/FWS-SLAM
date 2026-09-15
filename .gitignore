@@ -57,3 +57,6 @@ src/extractor_orb/fw_enhance
 .cache/
 .agents/
 .codex/
+
+# ---- 个人文档 ----
+说明文档/

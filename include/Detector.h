@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <dirent.h>
+#include <unistd.h>
 #include <iomanip>
 
 #include "Tracking.h"  // 移除这个包含，避免循环引用（使用第32行的前向声明代替）
@@ -32,6 +33,34 @@ namespace ORB_SLAM3
 // 定义了对象跟踪类，调用了orb-slam中的tracking
 class Tracking;
 
+/**
+ * 解析 TensorRT 引擎文件路径（去除硬编码绝对路径，便于迁移与开源）
+ * 优先级：
+ *   1. 环境变量（envName，如 FWS_ENGINE_MONO）
+ *   2. 可执行文件同级的 engine/ 目录（bin/slam_runner → <root>/engine/）
+ *   3. 当前工作目录下的 engine/
+ * 若都不存在则返回相对路径 engine/<fileName>，由调用方在加载时报错提示。
+ */
+inline std::string ResolveEnginePath(const char* envName, const char* fileName)
+{
+    if (const char* env = std::getenv(envName))
+        if (env[0] != '\0') return std::string(env);
+
+    char exePath[4096] = {0};
+    ssize_t n = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+    if (n > 0)
+    {
+        exePath[n] = '\0';
+        std::string dir(exePath);
+        size_t slash = dir.find_last_of('/');
+        if (slash != std::string::npos) dir = dir.substr(0, slash);  // 可执行文件所在目录
+        std::string cand = dir + "/../engine/" + fileName;
+        std::ifstream f(cand, std::ios::binary);
+        if (f.good()) return cand;
+    }
+    return std::string("engine/") + fileName;
+}
+
 // 检测结果结构体
 struct Detection
 {
@@ -47,7 +76,9 @@ class Detector
 {
 public:
     // 初始化目标检测器类
-    Detector();
+    // enginePathOverride: 非空时强制使用该引擎路径（右目线程传 engine_path_stereo）
+    // bRightEye: 右目检测线程（SetDetectionFlag 通知 Tracking 的右目完成标志）
+    Detector(const std::string& enginePathOverride = std::string(), bool bRightEye = false);
 	
     ~Detector();
 
@@ -55,20 +86,32 @@ public:
     Tracking *mpTracker;
 
     // std::string engine_path;
-    std::string engine_path = "/home/dl/FWS-SLAM/engine/visdrone_11m.engine";
+    // 引擎路径可通过环境变量覆盖：FWS_ENGINE_MONO / FWS_ENGINE_STEREO
+    std::string engine_path = ResolveEnginePath("FWS_ENGINE_MONO", "visdrone_11m.engine");
+
+    std::string engine_path_stereo = ResolveEnginePath("FWS_ENGINE_STEREO", "visdrone_11s.engine");
 
     std::vector<Detection> dynamic_boxes;
 
     std::vector<Detection> objects;
 
+    // 保护 objects 的读写：右目检测线程异步产出结果、Tracking 不等待直接读最新值
+    // （左目仍通过条件变量同步消费，不需要此锁）
+    std::mutex mMutexObjects;
+
+    // 右目（长焦）检测：当前仅用于可视化，不参与语义/动态管线
+    // （左右目交叉验证后续再接入，坐标保持右目原始图像坐标系）
+    std::vector<Detection> objectsRight;
+    cv::Mat mImgRight;             ///< 右目图像（由 Tracking 与左目一起送入）
+
     // 预定义Run方法
     void Run();
     // 预定义对象跟踪设置方法
     void SetTracker(Tracking *pTracker);
-    // 预定义是否是新的图像方法
-    bool isNewImgArrived();
     // 预定义目标检测方法
     void Detect();
+    // 对单张图像执行完整检测流程（预处理+推理+后处理+坐标反变换）
+    void DetectImage(cv::Mat& image, std::vector<Detection>& output);
 
     // 预定义检测是否完成的方法
     bool isFinished();
@@ -113,6 +156,10 @@ public:
 
     // 定义属性来标记这个请求是否已经完成（是不是目标检测请求已经完成？）
     bool mbFinishRequested;
+    // 检测器是否初始化成功（GPU/引擎加载失败时置 false，SLAM 主流程不阻塞）
+    bool mbDetectorReady;
+    bool IsReady() { return mbDetectorReady; }
+    bool mbRightEye = false;    // 右目检测线程标志
     // 定义异步操作，完成整个语义分割
     std::mutex mMutexFinish;
 
@@ -141,6 +188,11 @@ public:
     cudaStream_t stream;                 ///< CUDA流
     float* gpu_buffers[2];               ///< GPU缓冲区数组
     float* cpu_output_buffer;            ///< CPU输出缓冲区
+    // 预处理图像缓冲区（本实例私有）：左右目两个检测线程并发预处理时
+    // 必须各自持有独立缓冲，避免共享全局缓冲导致输入互相覆盖、
+    // 检测框位置偶发跳变（preprocess.cu 已改为按实例传入）
+    uint8_t* mPreprocHostBuf = nullptr;  ///< 主机端固定内存缓冲（pinned）
+    uint8_t* mPreprocDevBuf  = nullptr;  ///< 设备端内存缓冲
     bool warmup = true;                  ///< 模型预热标志
 
     // 检测框容器

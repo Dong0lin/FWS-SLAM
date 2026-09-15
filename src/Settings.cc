@@ -27,10 +27,33 @@
 #include <opencv2/core/eigen.hpp>
 
 #include <iostream>
+#include <algorithm>
+#include <limits>
 
 using namespace std;
 
 namespace ORB_SLAM3 {
+
+    namespace {
+        // 兼容两套 yaml 写法：优先 Camera1.<key>（ORB-SLAM3 新版），
+        // 回退到 Camera.<key>（ORB-SLAM2/MF-SLAM 旧版，长短焦标定文件使用）
+        float readCamera1Param(cv::FileStorage& fSettings, const std::string& key, bool& found, const bool required = true){
+            cv::FileNode node = fSettings["Camera1." + key];
+            if(node.empty())
+                node = fSettings["Camera." + key];
+            if(node.empty()){
+                if(required){
+                    std::cerr << "Camera1." << key << "/Camera." << key
+                              << " required parameter does not exist, aborting..." << std::endl;
+                    exit(-1);
+                }
+                found = false;
+                return 0.f;
+            }
+            found = true;
+            return node.real();
+        }
+    }
 
     template<>
     float Settings::readParameter<float>(cv::FileStorage& fSettings, const std::string& name, bool& found, const bool required){
@@ -46,7 +69,7 @@ namespace ORB_SLAM3 {
                 return 0.0f;
             }
         }
-        else if(!node.isReal()){
+        else if(!node.isReal() && !node.isInt()){
             std::cerr << name << " parameter must be a real number, aborting..." << std::endl;
             exit(-1);
         }
@@ -125,7 +148,12 @@ namespace ORB_SLAM3 {
     }
 
     Settings::Settings(const std::string &configFile, const int& sensor) :
-    bNeedToUndistort_(false), bNeedToRectify_(false), bNeedToResize1_(false), bNeedToResize2_(false) {
+    bNeedToUndistort_(false), bNeedToRectify_(false), bNeedToResize1_(false), bNeedToResize2_(false),
+    bMultiFocal_(false), combine_(""),
+    calibration1_(nullptr), calibration2_(nullptr),
+    originalCalib1_(nullptr), originalCalib2_(nullptr),
+    leftFocalMm_(4.f), rightFocalMm_(6.f), bFocalMmSet_(false),
+    minDepth_(0.f), maxDepth_(1e9f) {
         sensor_ = sensor;
 
         //Open settings file
@@ -146,8 +174,15 @@ namespace ORB_SLAM3 {
 
         //Read second camera if stereo (not rectified)
         if(sensor_ == System::STEREO || sensor_ == System::IMU_STEREO){
-            readCamera2(fSettings);
-            cout << "\t-Loaded camera 2" << endl;
+            bool bHasCombine = !fSettings["Camera.combine"].empty();
+            if(bHasCombine){
+                readMultiFocal(fSettings);
+                cout << "\t-Loaded multi-focal stereo calibration" << endl;
+            }
+            else{
+                readCamera2(fSettings);
+                cout << "\t-Loaded camera 2" << endl;
+            }
         }
 
         //Read image info
@@ -192,10 +227,10 @@ namespace ORB_SLAM3 {
             cameraType_ = PinHole;
 
             //Read intrinsic parameters
-            float fx = readParameter<float>(fSettings,"Camera1.fx",found);
-            float fy = readParameter<float>(fSettings,"Camera1.fy",found);
-            float cx = readParameter<float>(fSettings,"Camera1.cx",found);
-            float cy = readParameter<float>(fSettings,"Camera1.cy",found);
+            float fx = readCamera1Param(fSettings,"fx",found);
+            float fy = readCamera1Param(fSettings,"fy",found);
+            float cx = readCamera1Param(fSettings,"cx",found);
+            float cy = readCamera1Param(fSettings,"cy",found);
 
             vCalibration = {fx, fy, cx, cy};
 
@@ -203,20 +238,20 @@ namespace ORB_SLAM3 {
             originalCalib1_ = new Pinhole(vCalibration);
 
             //Check if it is a distorted PinHole
-            readParameter<float>(fSettings,"Camera1.k1",found,false);
+            readCamera1Param(fSettings,"k1",found,false);
             if(found){
-                readParameter<float>(fSettings,"Camera1.k3",found,false);
+                readCamera1Param(fSettings,"k3",found,false);
                 if(found){
                     vPinHoleDistorsion1_.resize(5);
-                    vPinHoleDistorsion1_[4] = readParameter<float>(fSettings,"Camera1.k3",found);
+                    vPinHoleDistorsion1_[4] = readCamera1Param(fSettings,"k3",found);
                 }
                 else{
                     vPinHoleDistorsion1_.resize(4);
                 }
-                vPinHoleDistorsion1_[0] = readParameter<float>(fSettings,"Camera1.k1",found);
-                vPinHoleDistorsion1_[1] = readParameter<float>(fSettings,"Camera1.k2",found);
-                vPinHoleDistorsion1_[2] = readParameter<float>(fSettings,"Camera1.p1",found);
-                vPinHoleDistorsion1_[3] = readParameter<float>(fSettings,"Camera1.p2",found);
+                vPinHoleDistorsion1_[0] = readCamera1Param(fSettings,"k1",found);
+                vPinHoleDistorsion1_[1] = readCamera1Param(fSettings,"k2",found);
+                vPinHoleDistorsion1_[2] = readCamera1Param(fSettings,"p1",found);
+                vPinHoleDistorsion1_[3] = readCamera1Param(fSettings,"p2",found);
             }
 
             //Check if we need to correct distortion from the images
@@ -228,10 +263,10 @@ namespace ORB_SLAM3 {
             cameraType_ = Rectified;
 
             //Read intrinsic parameters
-            float fx = readParameter<float>(fSettings,"Camera1.fx",found);
-            float fy = readParameter<float>(fSettings,"Camera1.fy",found);
-            float cx = readParameter<float>(fSettings,"Camera1.cx",found);
-            float cy = readParameter<float>(fSettings,"Camera1.cy",found);
+            float fx = readCamera1Param(fSettings,"fx",found);
+            float fy = readCamera1Param(fSettings,"fy",found);
+            float cx = readCamera1Param(fSettings,"cx",found);
+            float cy = readCamera1Param(fSettings,"cy",found);
 
             vCalibration = {fx, fy, cx, cy};
 
@@ -244,15 +279,15 @@ namespace ORB_SLAM3 {
             cameraType_ = KannalaBrandt;
 
             //Read intrinsic parameters
-            float fx = readParameter<float>(fSettings,"Camera1.fx",found);
-            float fy = readParameter<float>(fSettings,"Camera1.fy",found);
-            float cx = readParameter<float>(fSettings,"Camera1.cx",found);
-            float cy = readParameter<float>(fSettings,"Camera1.cy",found);
+            float fx = readCamera1Param(fSettings,"fx",found);
+            float fy = readCamera1Param(fSettings,"fy",found);
+            float cx = readCamera1Param(fSettings,"cx",found);
+            float cy = readCamera1Param(fSettings,"cy",found);
 
-            float k0 = readParameter<float>(fSettings,"Camera1.k1",found);
-            float k1 = readParameter<float>(fSettings,"Camera1.k2",found);
-            float k2 = readParameter<float>(fSettings,"Camera1.k3",found);
-            float k3 = readParameter<float>(fSettings,"Camera1.k4",found);
+            float k0 = readCamera1Param(fSettings,"k1",found);
+            float k1 = readCamera1Param(fSettings,"k2",found);
+            float k2 = readCamera1Param(fSettings,"k3",found);
+            float k3 = readCamera1Param(fSettings,"k4",found);
 
             vCalibration = {fx,fy,cx,cy,k0,k1,k2,k3};
 
@@ -353,6 +388,183 @@ namespace ORB_SLAM3 {
 
     }
 
+    void Settings::readMultiFocal(cv::FileStorage &fSettings) {
+        bool found;
+
+        // 焦距组合类型 "01"/"02"/"12"（本移植支持 "01"：宽短焦左目 + 长焦右目）
+        combine_ = readParameter<std::string>(fSettings,"Camera.combine",found);
+
+        // 右目（长焦）原始内参
+        rfx_ = readParameter<float>(fSettings,"rightCamera.fx",found);
+        rfy_ = readParameter<float>(fSettings,"rightCamera.fy",found);
+        rcx_ = readParameter<float>(fSettings,"rightCamera.cx",found);
+        rcy_ = readParameter<float>(fSettings,"rightCamera.cy",found);
+
+        // 立体校正输出（multi-focal-stereo-calib 格式）
+        leftD_  = readParameter<cv::Mat>(fSettings,"LEFT.D",found);
+        leftK_  = readParameter<cv::Mat>(fSettings,"LEFT.K",found);
+        leftR_  = readParameter<cv::Mat>(fSettings,"LEFT.R",found);
+        leftP_  = readParameter<cv::Mat>(fSettings,"LEFT.P",found);
+        rightD_ = readParameter<cv::Mat>(fSettings,"RIGHT.D",found);
+        rightK_ = readParameter<cv::Mat>(fSettings,"RIGHT.K",found);
+        rightR_ = readParameter<cv::Mat>(fSettings,"RIGHT.R",found);
+        rightP_ = readParameter<cv::Mat>(fSettings,"RIGHT.P",found);
+
+        if(leftK_.empty() || leftD_.empty() || leftR_.empty() || leftP_.empty() ||
+           rightK_.empty() || rightD_.empty() || rightR_.empty() || rightP_.empty()){
+            cerr << "ERROR: multi-focal rectification parameters (LEFT.*/RIGHT.*) are missing!" << endl;
+            exit(-1);
+        }
+
+        // 校正后的公共内参取 LEFT.P 的 K（左右 P 共享同一 fx/fy/cx/cy）
+        const double fxF = leftP_.at<double>(0,0);
+        const double fyF = leftP_.at<double>(1,1);
+        const double cxF = leftP_.at<double>(0,2);
+        const double cyF = leftP_.at<double>(1,2);
+
+        // 焦距比：右(长焦)fx / 左(短焦)fx（取原始内参）
+        const float fx1 = calibration1_->getParameter(0);
+        if(fx1 <= 0.f || rfx_ <= 0.f){
+            cerr << "ERROR: invalid focal lengths in multi-focal calibration" << endl;
+            exit(-1);
+        }
+        fFscale_ = rfx_ / fx1;
+
+        // 可选焦距参数 Stereo.LeftFocal / Stereo.RightFocal（mm）：
+        // 若两者都填了有效值，则以其比值（右/左）作为焦距比，
+        // 后续长短焦模式的匹配区域（ROI）与金字塔层补偿（Leyermis）都由它决定；
+        // 未填时回退到标定内参比（右fx/左fx）。
+        leftFocalMm_ = 4.f;
+        rightFocalMm_ = 6.f;
+        bFocalMmSet_ = false;
+        {
+            cv::FileNode nLF = fSettings["Stereo.LeftFocal"];
+            cv::FileNode nRF = fSettings["Stereo.RightFocal"];
+            if(!nLF.empty() && !nRF.empty()){
+                const float lf = (float)nLF.real();
+                const float rf = (float)nRF.real();
+                if(lf > 0.f && rf > 0.f){
+                    leftFocalMm_ = lf;
+                    rightFocalMm_ = rf;
+                    fFscale_ = rf / lf;
+                    bFocalMmSet_ = true;
+                }
+            }
+        }
+
+        // 用校正后的相机覆盖 camera1，使后续 mK/mpCamera/网格/投影全部使用公共校正坐标系
+        delete calibration1_;
+        calibration1_ = new Pinhole({(float)fxF, (float)fyF, (float)cxF, (float)cyF});
+
+        // bf 直接用 yaml 里的 Camera.bf（校正后 bf），ThDepth 直接作为深度阈值
+        bf_ = readParameter<float>(fSettings,"Camera.bf",found);
+        b_ = bf_ / (float)fxF;
+        thDepth_ = (float)readParameter<int>(fSettings,"ThDepth",found);
+
+        // 左图重叠视场 ROI：根据标定（LEFT/RIGHT 的 K/D/R/P）精确推出长焦视场
+        // 落在左目原始图像上的区域（替代 MF-SLAM 的近似公式——该公式只用了
+        // rightCamera.cx/cy 和焦距比，未考虑畸变/旋转，在 4mm/6mm 标定下
+        // 与真实区域偏差约 25px 且区域偏窄，表现为“匹配区域中心偏左、边缘目标超框”）。
+        // 流程：右图角点+边中点 -> 校正公共坐标（undistortPoints）-> 左目原始坐标（projectPoints）
+        int imW = readParameter<int>(fSettings,"Camera.width",found);
+        int imH = readParameter<int>(fSettings,"Camera.height",found);
+        bool bRoiFromCalib = false;
+        // 有标定矩阵（LEFT/RIGHT 的 K/D/R/P）时始终用标定精算重叠视场 ROI——
+        // 真实长焦镜头桶形畸变大，焦距比近似公式会把匹配区域算小（丢右半边缘可匹配特征）；
+        // 焦距参数（Stereo.LeftFocal/RightFocal）只用于金字塔层差（Leyermis）。
+        if(!leftK_.empty() && !leftD_.empty() && !leftR_.empty() && !leftP_.empty() &&
+           !rightK_.empty() && !rightD_.empty() && !rightR_.empty() && !rightP_.empty())
+        {
+            std::vector<cv::Point2f> vRc;
+            vRc.push_back(cv::Point2f(0.f, 0.f));
+            vRc.push_back(cv::Point2f((float)imW, 0.f));
+            vRc.push_back(cv::Point2f(0.f, (float)imH));
+            vRc.push_back(cv::Point2f((float)imW, (float)imH));
+            vRc.push_back(cv::Point2f((float)imW * 0.5f, 0.f));
+            vRc.push_back(cv::Point2f((float)imW * 0.5f, (float)imH));
+            vRc.push_back(cv::Point2f(0.f, (float)imH * 0.5f));
+            vRc.push_back(cv::Point2f((float)imW, (float)imH * 0.5f));
+
+            cv::Mat pts((int)vRc.size(), 2, CV_32F);
+            for(size_t k = 0; k < vRc.size(); k++)
+            {
+                pts.at<float>(k, 0) = vRc[k].x;
+                pts.at<float>(k, 1) = vRc[k].y;
+            }
+            pts = pts.reshape(2);
+            cv::undistortPoints(pts, pts, rightK_, rightD_, rightR_, rightP_);
+            pts = pts.reshape(1);
+
+            float minx = std::numeric_limits<float>::max(), miny = std::numeric_limits<float>::max();
+            float maxx = -std::numeric_limits<float>::max(), maxy = -std::numeric_limits<float>::max();
+            cv::Mat rvec = cv::Mat::zeros(3, 1, CV_64F);
+            cv::Mat tvec = cv::Mat::zeros(3, 1, CV_64F);
+            for(int k = 0; k < pts.rows; k++)
+            {
+                const double u = pts.at<float>(k, 0);
+                const double v = pts.at<float>(k, 1);
+                // 校正像素 -> 公共归一化坐标
+                cv::Mat xn(3, 1, CV_64F);
+                xn.at<double>(0, 0) = (u - cxF) / fxF;
+                xn.at<double>(1, 0) = (v - cyF) / fyF;
+                xn.at<double>(2, 0) = 1.0;
+                // -> 左目原始相机归一化坐标（LEFT.P 平移为 0）
+                cv::Mat xnL = leftR_.t() * xn;
+                // 注意：本机 OpenCV 构建的 projectPoints 不接受 CV_64FC3 输入，统一用 CV_32FC3
+                cv::Mat objPts(1, 1, CV_32FC3);
+                objPts.at<cv::Vec3f>(0, 0) = cv::Vec3f((float)xnL.at<double>(0, 0),
+                                                       (float)xnL.at<double>(1, 0),
+                                                       (float)xnL.at<double>(2, 0));
+                std::vector<cv::Point2f> vOut;
+                cv::projectPoints(objPts, rvec, tvec, leftK_, leftD_, vOut);
+                minx = std::min(minx, vOut[0].x); miny = std::min(miny, vOut[0].y);
+                maxx = std::max(maxx, vOut[0].x); maxy = std::max(maxy, vOut[0].y);
+            }
+
+            roiLeftUp_.x = std::max(minx, 0.f);
+            roiLeftUp_.y = std::max(miny, 0.f);
+            roiRightBottom_.x = std::min(maxx, (float)imW - 1.f);
+            roiRightBottom_.y = std::min(maxy, (float)imH - 1.f);
+            bRoiFromCalib = true;
+        }
+        if(!bRoiFromCalib)
+        {
+            // 回退：无标定矩阵（LEFT/RIGHT）时用 MF-SLAM Calibfind 近似公式
+            const float invFscale = 1.0f / fFscale_;
+            roiLeftUp_.x = std::max(rcx_ * (1.f - invFscale), 0.f);
+            roiLeftUp_.y = std::max(rcy_ * (1.f - invFscale), 0.f);
+            roiRightBottom_.x = std::min(roiLeftUp_.x + invFscale * imW, (float)imW - 1.f);
+            roiRightBottom_.y = std::min(roiLeftUp_.y + invFscale * imH, (float)imH - 1.f);
+        }
+
+        // MF 模式不做整图 remap（特征点在 Frame 内自行校正），也不需要去畸变
+        bNeedToRectify_ = false;
+        bNeedToUndistort_ = false;
+        bMultiFocal_ = true;
+
+        // 深度合理性门控（50m 航拍：太近/太远的立体匹配基本是假匹配）
+        {
+            cv::FileNode node = fSettings["Stereo.MinDepth"];
+            if(!node.empty())
+                minDepth_ = (float)node.real();
+            else
+                minDepth_ = 10.0f;
+            node = fSettings["Stereo.MaxDepth"];
+            if(!node.empty())
+                maxDepth_ = (float)node.real();
+            else
+                maxDepth_ = 300.0f;
+        }
+
+        cout << "\t-Multi-focal: combine=" << combine_
+             << " Fscale=" << fFscale_
+             << (bFocalMmSet_ ? " (from focal mm)" : " (from calibration)")
+             << " focalL=" << leftFocalMm_ << "mm focalR=" << rightFocalMm_ << "mm"
+             << " bf=" << bf_
+             << " rectified fx=" << fxF
+             << " ROI=[" << roiLeftUp_ << " -> " << roiRightBottom_ << "]" << endl;
+    }
+
     void Settings::readImageInfo(cv::FileStorage &fSettings) {
         bool found;
         //Read original and desired image dimensions
@@ -407,7 +619,7 @@ namespace ORB_SLAM3 {
             }
         }
 
-        fps_ = readParameter<int>(fSettings,"Camera.fps",found);
+        fps_ = readParameter<float>(fSettings,"Camera.fps",found);
         bRGB_ = (bool) readParameter<int>(fSettings,"Camera.RGB",found);
     }
 
@@ -551,25 +763,27 @@ namespace ORB_SLAM3 {
         }
 
         if(settings.sensor_ == System::STEREO || settings.sensor_ == System::IMU_STEREO){
-            output << "\t-Camera 2 parameters (";
-            if(settings.cameraType_ == Settings::PinHole || settings.cameraType_ ==  Settings::Rectified){
-                output << "Pinhole";
-            }
-            else{
-                output << "Kannala-Brandt";
-            }
-            output << "" << ": [";
-            for(size_t i = 0; i < settings.originalCalib2_->size(); i++){
-                output << " " << settings.originalCalib2_->getParameter(i);
-            }
-            output << " ]" << endl;
-
-            if(!settings.vPinHoleDistorsion2_.empty()){
-                output << "\t-Camera 1 distortion parameters: [ ";
-                for(float d : settings.vPinHoleDistorsion2_){
-                    output << " " << d;
+            if(settings.originalCalib2_){
+                output << "\t-Camera 2 parameters (";
+                if(settings.cameraType_ == Settings::PinHole || settings.cameraType_ ==  Settings::Rectified){
+                    output << "Pinhole";
+                }
+                else{
+                    output << "Kannala-Brandt";
+                }
+                output << "" << ": [";
+                for(size_t i = 0; i < settings.originalCalib2_->size(); i++){
+                    output << " " << settings.originalCalib2_->getParameter(i);
                 }
                 output << " ]" << endl;
+
+                if(!settings.vPinHoleDistorsion2_.empty()){
+                    output << "\t-Camera 2 distortion parameters: [ ";
+                    for(float d : settings.vPinHoleDistorsion2_){
+                        output << " " << d;
+                    }
+                    output << " ]" << endl;
+                }
             }
         }
 

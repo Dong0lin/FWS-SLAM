@@ -394,20 +394,4 @@ long unsigned int Atlas::GetNumLivedMP() {
     return num;
 }
 
-map<long unsigned int, KeyFrame*> Atlas::GetAtlasKeyframes()
-{
-    map<long unsigned int, KeyFrame*> mpIdKFs;
-    for(Map* pMap_i : mvpBackupMaps)
-    {
-        vector<KeyFrame*> vpKFs_Mi = pMap_i->GetAllKeyFrames();
-
-        for(KeyFrame* pKF_j_Mi : vpKFs_Mi)
-        {
-            mpIdKFs[pKF_j_Mi->mnId] = pKF_j_Mi;
-        }
-    }
-
-    return mpIdKFs;
-}
-
 } //namespace ORB_SLAM3

@@ -45,9 +45,16 @@ struct Detection3D
     float width;                     // 3D宽度
     float depth;                     // 3D深度
     float height;                    // 3D高度
+    Eigen::Vector3f heading = Eigen::Vector3f::Zero();  // 车长轴方向（平面内单位向量，方向无关；未设置=零）
     int nObservations;               // 被观测次数 (用于去重和置信度)
     bool bValid;                     // 是否有效
     bool bFrozen = false;            // 是否已冻结（观测足够后位置不再更新）
+
+    // ===== 融合统计（P0: 置信度加权 + 稳定性冻结）=====
+    // 仅用于 AddOrUpdateDetection3D 的在线融合，不参与序列化/可视化
+    float confidence = 0.f;   // 观测置信度均值（来自 2D 检测 det.conf）
+    float centerVar  = 0.f;   // 中心位置的指数加权方差（SLAM单位^2）
+    float wSum       = 0.f;   // 置信度权重累计（增量加权均值分母）
 };
 
 class Map
@@ -103,7 +110,6 @@ public:
     long unsigned int GetId();
 
     long unsigned int GetInitKFid();
-    void SetInitKFid(long unsigned int initKFif);
     long unsigned int GetMaxKFid();
 
     KeyFrame* GetOriginKF();
@@ -152,7 +158,6 @@ public:
     float GetPlaneRefHeight() const;
     float GetPlaneRefOffset() const;
     float GetPlaneDynamicOffset() const;
-    float GetDistanceToNearestPlane(const Eigen::Vector3f& Pw) const;
     bool IsPlaneEstimated();
 
     void SetPlaneScaleLambda(float lambda);

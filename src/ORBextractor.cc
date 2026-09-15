@@ -58,6 +58,9 @@
 #include <opencv2/imgproc/imgproc.hpp>
 #include <vector>
 #include <iostream>
+#include <algorithm>
+#include <cmath>
+#include <limits>
 
 #include "ORBextractor.h"
 
@@ -67,6 +70,13 @@ using namespace std;
 
 namespace ORB_SLAM3
 {
+
+float ORBextractor::msFocalScale = 1.0f;
+cv::Point2f ORBextractor::msROILeftUp(0.f, 0.f);
+cv::Point2f ORBextractor::msROIRightBottom(0.f, 0.f);
+cv::Point2f ORBextractor::msROIRectLeftUp(0.f, 0.f);
+cv::Point2f ORBextractor::msROIRectRightBottom(0.f, 0.f);
+
 
     const int PATCH_SIZE = 31;
     const int HALF_PATCH_SIZE = 15;
@@ -433,14 +443,27 @@ namespace ORB_SLAM3
 
         mnFeaturesPerLevel.resize(nlevels);
         float factor = 1.0f / scaleFactor;
-        float nDesiredFeaturesPerScale = nfeatures*(1 - factor)/(1 - (float)pow((double)factor, (double)nlevels));
+        // 长短焦模式：MF-SLAM 会跳过无法与长焦对应上的低层（大尺度）金字塔，
+        // 但实测会丢掉大尺度稳定特征，匹配数反而下降，这里默认关闭（extractorlev=0）
+        const int extractorlev = 0;
+
+        float nDesiredFeaturesPerScale = nfeatures*(1 - factor)/
+                (1 - (float)pow((double)factor, (double)(nlevels - extractorlev)));
 
         int sumFeatures = 0;
         for( int level = 0; level < nlevels-1; level++ )
         {
-            mnFeaturesPerLevel[level] = cvRound(nDesiredFeaturesPerScale);
-            sumFeatures += mnFeaturesPerLevel[level];
-            nDesiredFeaturesPerScale *= factor;
+            if(level < extractorlev)
+            {
+                mnFeaturesPerLevel[level] = 0;
+                sumFeatures += mnFeaturesPerLevel[level];
+            }
+            else
+            {
+                mnFeaturesPerLevel[level] = cvRound(nDesiredFeaturesPerScale);
+                sumFeatures += mnFeaturesPerLevel[level];
+                nDesiredFeaturesPerScale *= factor;
+            }
         }
         mnFeaturesPerLevel[nlevels-1] = std::max(nfeatures - sumFeatures, 0);
 
@@ -550,6 +573,11 @@ namespace ORB_SLAM3
                 return false;
             }
         }
+    }
+
+    static bool CompareResponse(cv::KeyPoint& kp1, cv::KeyPoint& kp2)
+    {
+        return kp1.response > kp2.response;
     }
 
     vector<cv::KeyPoint> ORBextractor::DistributeOctTree(const vector<cv::KeyPoint>& vToDistributeKeys, const int &minX,
@@ -778,7 +806,313 @@ namespace ORB_SLAM3
         return vResultKeys;
     }
 
-    void ORBextractor::ComputeKeyPointsOctTree(vector<vector<KeyPoint> >& allKeypoints)
+    vector<cv::KeyPoint> ORBextractor::JinLnDistributeOctTree(const vector<cv::KeyPoint>& vToDistributeKeys, const int &minX,
+                                                              const int &maxX, const int &minY, const int &maxY,
+                                                              const int &N, const int &level, const int &flag)
+    {
+        // Compute how many initial nodes
+        const int nIni = round(static_cast<float>(maxX-minX)/(maxY-minY));
+
+        const float hX = static_cast<float>(maxX-minX)/nIni;
+
+        list<ExtractorNode> lNodes;
+
+        vector<ExtractorNode*> vpIniNodes;
+        vpIniNodes.resize(nIni);
+
+        for(int i=0; i<nIni; i++)
+        {
+            ExtractorNode ni;
+            ni.UL = cv::Point2i(hX*static_cast<float>(i),0);
+            ni.UR = cv::Point2i(hX*static_cast<float>(i+1),0);
+            ni.BL = cv::Point2i(ni.UL.x,maxY-minY);
+            ni.BR = cv::Point2i(ni.UR.x,maxY-minY);
+            ni.vKeys.reserve(vToDistributeKeys.size());
+
+            lNodes.push_back(ni);
+            vpIniNodes[i] = &lNodes.back();
+        }
+
+        //Associate points to childs
+        for(size_t i=0;i<vToDistributeKeys.size();i++)
+        {
+            const cv::KeyPoint &kp = vToDistributeKeys[i];
+            vpIniNodes[kp.pt.x/hX]->vKeys.push_back(kp);
+        }
+
+        list<ExtractorNode>::iterator lit = lNodes.begin();
+
+        while(lit!=lNodes.end())
+        {
+            if(lit->vKeys.size()==1)
+            {
+                lit->bNoMore=true;
+                lit++;
+            }
+            else if(lit->vKeys.empty())
+                lit = lNodes.erase(lit);
+            else
+                lit++;
+        }
+
+        bool bFinish = false;
+
+        int iteration = 0;
+
+        vector<pair<int,ExtractorNode*> > vSizeAndPointerToNode;
+        vSizeAndPointerToNode.reserve(lNodes.size()*4);
+
+        while(!bFinish)
+        {
+            iteration++;
+
+            int prevSize = lNodes.size();
+
+            lit = lNodes.begin();
+
+            int nToExpand = 0;
+
+            vSizeAndPointerToNode.clear();
+
+            while(lit!=lNodes.end())
+            {
+                if(lit->bNoMore)
+                {
+                    // If node only contains one point do not subdivide and continue
+                    lit++;
+                    continue;
+                }
+                else
+                {
+                    // If more than one point, subdivide
+                    ExtractorNode n1,n2,n3,n4;
+                    lit->DivideNode(n1,n2,n3,n4);
+
+                    // Add childs if they contain points
+                    if(n1.vKeys.size()>0)
+                    {
+                        lNodes.push_front(n1);
+                        if(n1.vKeys.size()>1)
+                        {
+                            nToExpand++;
+                            vSizeAndPointerToNode.push_back(make_pair(n1.vKeys.size(),&lNodes.front()));
+                            lNodes.front().lit = lNodes.begin();
+                        }
+                    }
+                    if(n2.vKeys.size()>0)
+                    {
+                        lNodes.push_front(n2);
+                        if(n2.vKeys.size()>1)
+                        {
+                            nToExpand++;
+                            vSizeAndPointerToNode.push_back(make_pair(n2.vKeys.size(),&lNodes.front()));
+                            lNodes.front().lit = lNodes.begin();
+                        }
+                    }
+                    if(n3.vKeys.size()>0)
+                    {
+                        lNodes.push_front(n3);
+                        if(n3.vKeys.size()>1)
+                        {
+                            nToExpand++;
+                            vSizeAndPointerToNode.push_back(make_pair(n3.vKeys.size(),&lNodes.front()));
+                            lNodes.front().lit = lNodes.begin();
+                        }
+                    }
+                    if(n4.vKeys.size()>0)
+                    {
+                        lNodes.push_front(n4);
+                        if(n4.vKeys.size()>1)
+                        {
+                            nToExpand++;
+                            vSizeAndPointerToNode.push_back(make_pair(n4.vKeys.size(),&lNodes.front()));
+                            lNodes.front().lit = lNodes.begin();
+                        }
+                    }
+
+                    lit=lNodes.erase(lit);
+                    continue;
+                }
+            }
+
+            // Finish if there are more nodes than required features
+            // or all nodes contain just one point
+            if((int)lNodes.size()>=N || (int)lNodes.size()==prevSize)
+            {
+                bFinish = true;
+            }
+            else if(((int)lNodes.size()+nToExpand*3)>N)
+            {
+
+                while(!bFinish)
+                {
+
+                    prevSize = lNodes.size();
+
+                    vector<pair<int,ExtractorNode*> > vPrevSizeAndPointerToNode = vSizeAndPointerToNode;
+                    vSizeAndPointerToNode.clear();
+
+                    sort(vPrevSizeAndPointerToNode.begin(),vPrevSizeAndPointerToNode.end(),compareNodes);
+                    for(int j=vPrevSizeAndPointerToNode.size()-1;j>=0;j--)
+                    {
+                        ExtractorNode n1,n2,n3,n4;
+                        vPrevSizeAndPointerToNode[j].second->DivideNode(n1,n2,n3,n4);
+
+                        // Add childs if they contain points
+                        if(n1.vKeys.size()>0)
+                        {
+                            lNodes.push_front(n1);
+                            if(n1.vKeys.size()>1)
+                            {
+                                vSizeAndPointerToNode.push_back(make_pair(n1.vKeys.size(),&lNodes.front()));
+                                lNodes.front().lit = lNodes.begin();
+                            }
+                        }
+                        if(n2.vKeys.size()>0)
+                        {
+                            lNodes.push_front(n2);
+                            if(n2.vKeys.size()>1)
+                            {
+                                vSizeAndPointerToNode.push_back(make_pair(n2.vKeys.size(),&lNodes.front()));
+                                lNodes.front().lit = lNodes.begin();
+                            }
+                        }
+                        if(n3.vKeys.size()>0)
+                        {
+                            lNodes.push_front(n3);
+                            if(n3.vKeys.size()>1)
+                            {
+                                vSizeAndPointerToNode.push_back(make_pair(n3.vKeys.size(),&lNodes.front()));
+                                lNodes.front().lit = lNodes.begin();
+                            }
+                        }
+                        if(n4.vKeys.size()>0)
+                        {
+                            lNodes.push_front(n4);
+                            if(n4.vKeys.size()>1)
+                            {
+                                vSizeAndPointerToNode.push_back(make_pair(n4.vKeys.size(),&lNodes.front()));
+                                lNodes.front().lit = lNodes.begin();
+                            }
+                        }
+
+                        lNodes.erase(vPrevSizeAndPointerToNode[j].second->lit);
+
+                        if((int)lNodes.size()>=N)
+                            break;
+                    }
+
+                    if((int)lNodes.size()>=N || (int)lNodes.size()==prevSize)
+                        bFinish = true;
+
+                }
+            }
+        }
+
+        // Retain the best point in each node
+        vector<cv::KeyPoint> vResultKeys;
+        vResultKeys.reserve(nfeatures);
+
+        if(flag == 0 && msFocalScale > 1.0f && msROIRightBottom.x > msROILeftUp.x)
+        {
+            // ---- 左目（短焦）：ROI（与长焦重叠视场）内每个节点保留最大+次大响应点 ----
+            // 当前金字塔层的 ROI（原始图像坐标，随层缩放）
+            const float invScale = 1.0f / mvScaleFactor[level];
+            const float levelLeftUpX   = msROILeftUp.x * invScale;
+            const float levelLeftUpY   = msROILeftUp.y * invScale;
+            const float levelRightBtmX = msROIRightBottom.x * invScale;
+            const float levelRightBtmY = msROIRightBottom.y * invScale;
+
+            vector<cv::KeyPoint> PointsmaxResponse;
+            vector<cv::KeyPoint> PointssecondResponse;
+
+            for(list<ExtractorNode>::iterator it = lNodes.begin(); it != lNodes.end(); it++)
+            {
+                vector<cv::KeyPoint> &vNodeKeys = it->vKeys;
+                cv::KeyPoint *pKP = &vNodeKeys[0];
+                float maxResponse = pKP->response;
+                float secondspnse = -std::numeric_limits<float>::max();
+                cv::KeyPoint *maxpKP = &vNodeKeys[0];
+                cv::KeyPoint *secondpKP = &vNodeKeys[0];
+
+                for(size_t k = 1; k < vNodeKeys.size(); k++)
+                {
+                    if(vNodeKeys[k].response > maxResponse)
+                    {
+                        secondpKP = pKP;
+                        pKP = &vNodeKeys[k];
+                        secondspnse = maxResponse;
+                        maxResponse = vNodeKeys[k].response;
+                    }
+                    if(vNodeKeys[k].response > secondspnse && vNodeKeys[k].response < maxResponse)
+                    {
+                        secondpKP = &vNodeKeys[k];
+                        secondspnse = vNodeKeys[k].response;
+                    }
+                }
+                PointsmaxResponse.push_back(*maxpKP);
+                PointssecondResponse.push_back(*secondpKP);
+            }
+
+            vector<cv::KeyPoint> outRoImaxResponse;
+            vector<cv::KeyPoint> RoIsecondResponse;
+
+            for(size_t i = 0; i < PointsmaxResponse.size(); i++)
+            {
+                const float px = PointsmaxResponse[i].pt.x;
+                const float py = PointsmaxResponse[i].pt.y;
+                if(px > levelLeftUpX && px < levelRightBtmX && py > levelLeftUpY && py < levelRightBtmY)
+                    vResultKeys.push_back(PointsmaxResponse[i]);   // ROI 内最大值直接保留
+                else
+                    outRoImaxResponse.push_back(PointsmaxResponse[i]);
+            }
+
+            for(size_t i = 0; i < PointssecondResponse.size(); i++)
+            {
+                const float px = PointssecondResponse[i].pt.x;
+                const float py = PointssecondResponse[i].pt.y;
+                if(px > levelLeftUpX && px < levelRightBtmX && py > levelLeftUpY && py < levelRightBtmY)
+                    RoIsecondResponse.push_back(PointssecondResponse[i]);
+            }
+
+            // ROI 内次大响应点加入数量：比例 sqrt(Fscale)-1
+            sort(RoIsecondResponse.begin(), RoIsecondResponse.end(), CompareResponse);
+            const float Roiratio = pow(msFocalScale, 0.5) - 1.0f;
+            const int roisecondadd = (int)round((float)RoIsecondResponse.size() * Roiratio);
+            for(int i = 0; i < roisecondadd && i < (int)RoIsecondResponse.size(); i++)
+                vResultKeys.push_back(RoIsecondResponse[i]);
+
+            // ROI 外按比例减少（总数仍约为 N）
+            sort(outRoImaxResponse.begin(), outRoImaxResponse.end(), CompareResponse);
+            const int outroimaxadd = (int)outRoImaxResponse.size() - roisecondadd;
+            for(int i = 0; i < outroimaxadd && i < (int)outRoImaxResponse.size(); i++)
+                vResultKeys.push_back(outRoImaxResponse[i]);
+        }
+        else
+        {
+            // 右目（长焦）或同焦距：每个节点只保留最大响应点（标准行为）
+            for(list<ExtractorNode>::iterator lit=lNodes.begin(); lit!=lNodes.end(); lit++)
+            {
+                vector<cv::KeyPoint> &vNodeKeys = lit->vKeys;
+                cv::KeyPoint* pKP = &vNodeKeys[0];
+                float maxResponse = pKP->response;
+
+                for(size_t k=1; k<vNodeKeys.size(); k++)
+                {
+                    if(vNodeKeys[k].response>maxResponse)
+                    {
+                        pKP = &vNodeKeys[k];
+                        maxResponse = vNodeKeys[k].response;
+                    }
+                }
+                vResultKeys.push_back(*pKP);
+            }
+        }
+
+        return vResultKeys;
+    }
+
+    void ORBextractor::ComputeKeyPointsOctTree(vector<vector<KeyPoint> >& allKeypoints, const int FLAG)
     {
         allKeypoints.resize(nlevels);
 
@@ -874,8 +1208,20 @@ namespace ORB_SLAM3
             vector<KeyPoint> & keypoints = allKeypoints[level];
             keypoints.reserve(nfeatures);
 
-            keypoints = DistributeOctTree(vToDistributeKeys, minBorderX, maxBorderX,
-                                          minBorderY, maxBorderY,mnFeaturesPerLevel[level], level);
+            if(FLAG == 0 && msFocalScale > 1.0f &&
+               msROIRectRightBottom.x > msROIRectLeftUp.x &&
+               (msROIRectRightBottom.x - msROIRectLeftUp.x) < 0.85f * (float)mvImagePyramid[level].cols)
+            {
+                // 长短焦左目（短焦）：仅当长焦视场在短焦图中明显小于全图时，
+                // 才在重叠ROI内加密提取（当前4mm/6mm标定长焦视场≈全图，走标准提取）
+                keypoints = JinLnDistributeOctTree(vToDistributeKeys, minBorderX, maxBorderX,
+                                                   minBorderY, maxBorderY, mnFeaturesPerLevel[level], level, FLAG);
+            }
+            else
+            {
+                keypoints = DistributeOctTree(vToDistributeKeys, minBorderX, maxBorderX,
+                                              minBorderY, maxBorderY, mnFeaturesPerLevel[level], level);
+            }
 
             const int scaledPatchSize = PATCH_SIZE*mvScaleFactor[level];
 
@@ -1084,7 +1430,7 @@ namespace ORB_SLAM3
     }
 
     int ORBextractor::operator()( InputArray _image, InputArray _mask, vector<KeyPoint>& _keypoints,
-                                  OutputArray _descriptors, std::vector<int> &vLappingArea)
+                                  OutputArray _descriptors, std::vector<int> &vLappingArea, int FLAG)
     {
         //cout << "[ORBextractor]: Max Features: " << nfeatures << endl;
         if(_image.empty())
@@ -1097,7 +1443,7 @@ namespace ORB_SLAM3
         ComputePyramid(image);
 
         vector < vector<KeyPoint> > allKeypoints;
-        ComputeKeyPointsOctTree(allKeypoints);
+        ComputeKeyPointsOctTree(allKeypoints, FLAG);
         //ComputeKeyPointsOld(allKeypoints);
 
         Mat descriptors;

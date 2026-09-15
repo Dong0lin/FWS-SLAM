@@ -188,12 +188,6 @@ long unsigned int Map::GetInitKFid()
     return mnInitKFid;
 }
 
-void Map::SetInitKFid(long unsigned int initKFif)
-{
-    unique_lock<mutex> lock(mMutexMap);
-    mnInitKFid = initKFif;
-}
-
 long unsigned int Map::GetMaxKFid()
 {
     unique_lock<mutex> lock(mMutexMap);
@@ -515,18 +509,6 @@ const std::vector<float>& Map::GetPlaneOffsets() const
     return mvpPlaneOffsets;
 }
 
-float Map::GetDistanceToNearestPlane(const Eigen::Vector3f& Pw) const
-{
-    if(!mbPlaneEstimated || mvpPlaneOffsets.empty()) return 0.0f;
-    float signedDist = mPlaneNormal.dot(Pw);
-    float minDist = std::abs(signedDist - mvpPlaneOffsets[0]);
-    for(size_t i = 1; i < mvpPlaneOffsets.size(); i++) {
-        float d = std::abs(signedDist - mvpPlaneOffsets[i]);
-        if(d < minDist) minDist = d;
-    }
-    return minDist;
-}
-
 bool Map::IsPlaneEstimated()
 {
     unique_lock<mutex> lock(mMutexMap);
@@ -595,38 +577,122 @@ void Map::ClearTriangRatios()
     mvTriangRatios.clear();
 }
 
+// 有向矩形（地面足迹）相交面积比：相交面积 / 较小矩形面积，返回 [0,1]。
+// Detection3D 已带朝向，长条目标(车/公交)比等面积圆近似精确得多；
+// 朝向无效时退化为平面内轴对齐矩形兜底。
+static float OrientedFootprintOverlapRatio(const Detection3D& a, const Detection3D& b,
+                                           const Eigen::Vector3f& nIn)
+{
+    Eigen::Vector3f n = nIn;
+    if(n.norm() < 1e-6f) n = Eigen::Vector3f::UnitZ();
+    n.normalize();
+    const Eigen::Vector3f ref = (std::abs(n.x()) < 0.9f) ? Eigen::Vector3f::UnitX()
+                                                         : Eigen::Vector3f::UnitZ();
+    const Eigen::Vector3f e1 = n.cross(ref).normalized();
+    const Eigen::Vector3f e2 = n.cross(e1).normalized();
+
+    auto rect = [&](const Detection3D& d, Eigen::Vector2f out[4]) {
+        Eigen::Vector3f h = d.heading;
+        h -= n * n.dot(h);
+        if(h.squaredNorm() < 0.25f) h = e1;          // 无有效朝向 → 轴对齐兜底
+        else h.normalize();
+        const Eigen::Vector3f w = n.cross(h).normalized();
+        const float hd = std::max(d.depth, 1e-4f) * 0.5f;
+        const float hw = std::max(d.width, 1e-4f) * 0.5f;
+        const Eigen::Vector3f c = d.center - n * n.dot(d.center);   // 投到平面
+        const Eigen::Vector3f cs[4] = {
+            c - h*hd - w*hw, c + h*hd - w*hw, c + h*hd + w*hw, c - h*hd + w*hw};
+        for(int i = 0; i < 4; i++)
+            out[i] = Eigen::Vector2f(e1.dot(cs[i]), e2.dot(cs[i]));
+    };
+
+    Eigen::Vector2f A[4], B[4];
+    rect(a, A);
+    rect(b, B);
+
+    auto area = [](const Eigen::Vector2f p[4]) {
+        float s = 0.f;
+        for(int i = 0; i < 4; i++) {
+            const Eigen::Vector2f& q = p[(i+1) % 4];
+            s += p[i].x()*q.y() - q.x()*p[i].y();
+        }
+        return std::abs(s) * 0.5f;
+    };
+
+    // 裁剪多边形 B 保证逆时针（inside 以"有向边左侧"为正）
+    float sb = 0.f;
+    for(int i = 0; i < 4; i++) {
+        const Eigen::Vector2f& q = B[(i+1) % 4];
+        sb += B[i].x()*q.y() - q.x()*B[i].y();
+    }
+    Eigen::Vector2f Bc[4];
+    for(int i = 0; i < 4; i++) Bc[i] = (sb < 0.f) ? B[3-i] : B[i];
+
+    auto inside = [](const Eigen::Vector2f& p, const Eigen::Vector2f& a0, const Eigen::Vector2f& a1) {
+        return (a1.x()-a0.x())*(p.y()-a0.y()) - (a1.y()-a0.y())*(p.x()-a0.x()) >= 0.f;
+    };
+    auto intersect = [](const Eigen::Vector2f& p, const Eigen::Vector2f& q,
+                        const Eigen::Vector2f& a0, const Eigen::Vector2f& a1) {
+        const float x1=p.x(), y1=p.y(), x2=q.x(), y2=q.y();
+        const float x3=a0.x(), y3=a0.y(), x4=a1.x(), y4=a1.y();
+        const float den = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4);
+        if(std::abs(den) < 1e-12f) return q;
+        const float t = ((x1-x3)*(y3-y4) - (y1-y3)*(x3-x4)) / den;
+        return Eigen::Vector2f(x1 + t*(x2-x1), y1 + t*(y2-y1));
+    };
+
+    // Sutherland–Hodgman：用凸多边形 B 裁剪 A
+    std::vector<Eigen::Vector2f> poly(A, A+4);
+    for(int i = 0; i < 4 && !poly.empty(); i++) {
+        const Eigen::Vector2f a0 = Bc[i], a1 = Bc[(i+1) % 4];
+        std::vector<Eigen::Vector2f> out;
+        out.reserve(poly.size() + 4);
+        for(size_t j = 0; j < poly.size(); j++) {
+            const Eigen::Vector2f cur = poly[j];
+            const Eigen::Vector2f prv = poly[(j + poly.size() - 1) % poly.size()];
+            const bool curIn = inside(cur, a0, a1);
+            const bool prvIn = inside(prv, a0, a1);
+            if(curIn) {
+                if(!prvIn) out.push_back(intersect(prv, cur, a0, a1));
+                out.push_back(cur);
+            } else if(prvIn) {
+                out.push_back(intersect(prv, cur, a0, a1));
+            }
+        }
+        poly.swap(out);
+    }
+    if(poly.size() < 3) return 0.f;
+
+    float sInter = 0.f;
+    for(size_t i = 0; i < poly.size(); i++) {
+        const Eigen::Vector2f& q = poly[(i+1) % poly.size()];
+        sInter += poly[i].x()*q.y() - q.x()*poly[i].y();
+    }
+    const float interArea = std::abs(sInter) * 0.5f;
+    const float minArea = std::min(area(A), area(B));
+    if(minArea <= 1e-9f) return 0.f;
+    return std::min(1.f, interArea / minArea);
+}
+
 bool Map::AddOrUpdateDetection3D(const Detection3D& box, bool bAllowNew)
 {
     unique_lock<mutex> lock(mMutexMap);
 
-    // 足迹近似为等面积圆, 计算重合比例 (旋转无关; Detection3D未存朝向, 无法做精确矩形IoU)
-    // 返回: 相交面积 / 较小圆面积, 范围[0, 1]
-    auto footprintOverlapRatio = [](const Detection3D& a, const Detection3D& b) -> float {
-        const float PI = 3.14159265f;
-        float r1 = std::sqrt(std::max(a.width * a.depth, 1e-8f) / PI);
-        float r2 = std::sqrt(std::max(b.width * b.depth, 1e-8f) / PI);
-        float d = (a.center - b.center).norm();
-        if(d >= r1 + r2) return 0.0f;                       // 无重合
-        float rmin = std::min(r1, r2), rmax = std::max(r1, r2);
-        float areaMin = PI * rmin * rmin;
-        if(d <= rmax - rmin) return 1.0f;                   // 小圆完全被包含
-        // 圆-圆相交面积 (透镜公式)
-        float d2 = d*d, r1sq = r1*r1, r2sq = r2*r2;
-        float ca = std::max(-1.0f, std::min(1.0f, (d2 + r1sq - r2sq) / (2.0f*d*r1)));
-        float cb = std::max(-1.0f, std::min(1.0f, (d2 + r2sq - r1sq) / (2.0f*d*r2)));
-        float alpha = std::acos(ca), beta = std::acos(cb);
-        float area = r1sq*(alpha - 0.5f*std::sin(2.0f*alpha)) + r2sq*(beta - 0.5f*std::sin(2.0f*beta));
-        return area / areaMin;
-    };
-
-    const float MERGE_RATIO = 0.3f;  // 重合比例超过此值且同类 → 判定为同一目标
+    // ===== P0 融合参数 =====
+    const float MERGE_RATIO        = 0.3f;   // 足迹重合比例超过此值且同类 → 同一目标
+    const int   MIN_FREEZE_OBS     = 5;      // 冻结前最少观测次数（原为 3，太易锁死坏值）
+    const float FREEZE_STD_FACTOR  = 0.5f;   // 中心标准差 < 系数×min(W,D) 才冻结
+    const float MIN_OBS_W          = 0.05f;  // 观测置信度权重下限（防 0 权重）
+    const float OUTLIER_SIGMA      = 3.0f;   // 离群门：3σ
+    const float OUTLIER_MIN_FACTOR = 1.5f;   // 离群门下限：1.5×min(W,D)
+    // =======================
 
     // 先遍历所有历史框, 找同类最佳重合候选, 同时记录是否存在任意重合
     int bestIdx = -1;
     float bestRatio = 0.0f;
     bool bAnyOverlap = false;
     for(size_t i = 0; i < mvPersistentBoxes.size(); i++) {
-        float ratio = footprintOverlapRatio(mvPersistentBoxes[i], box);
+        float ratio = OrientedFootprintOverlapRatio(mvPersistentBoxes[i], box, mPlaneNormal);
         if(ratio <= 1e-3f) continue;
         bAnyOverlap = true;
         if(mvPersistentBoxes[i].class_id == box.class_id && ratio > bestRatio) {
@@ -636,18 +702,52 @@ bool Map::AddOrUpdateDetection3D(const Detection3D& box, bool bAllowNew)
     }
 
     if(bestIdx >= 0 && bestRatio > MERGE_RATIO) {
-        // 同一目标: 平均融合位置和尺寸
         Detection3D& existing = mvPersistentBoxes[bestIdx];
+
+        // 离群观测丢弃：成熟框(n>=3)且新中心偏离超过门限时忽略本次观测，
+        // 避免个别远距离坏估计把已经稳定的框拽走。
+        const float scaleRef = std::max(std::min(existing.width, existing.depth), 1e-4f);
+        const float stdC = std::sqrt(std::max(existing.centerVar, 0.f));
+        const float outlierGate = std::max(OUTLIER_SIGMA * stdC, OUTLIER_MIN_FACTOR * scaleRef);
+        if(existing.nObservations >= 3 && (box.center - existing.center).norm() > outlierGate)
+            return false;
+
+        // 置信度加权增量均值：w = conf_new / (Σconf)，高置信观测影响更大
+        const float wNew = std::max(box.confidence, MIN_OBS_W);
+        if(existing.wSum <= 0.f) existing.wSum = std::max(existing.confidence, MIN_OBS_W);
+        existing.wSum += wNew;
+        const float alpha = wNew / existing.wSum;
+
+        // 指数加权方差（用于稳定性冻结判据），恒非负
+        const Eigen::Vector3f delta = box.center - existing.center;
+        existing.center += alpha * delta;
+        existing.centerVar = (1.f - alpha) * existing.centerVar
+                           + alpha * delta.dot(box.center - existing.center);
+        if(existing.centerVar < 0.f) existing.centerVar = 0.f;
+
+        existing.width  += alpha * (box.width  - existing.width);
+        existing.depth  += alpha * (box.depth  - existing.depth);
+        existing.height += alpha * (box.height - existing.height);
+        existing.confidence += alpha * (box.confidence - existing.confidence);
+
+        // 朝向（方向无关轴，模π一致后加权平均）
+        if(box.heading.squaredNorm() > 0.5f) {
+            if(existing.heading.squaredNorm() <= 0.5f)
+                existing.heading = box.heading.normalized();
+            else {
+                Eigen::Vector3f hNew = box.heading.normalized();
+                if(hNew.dot(existing.heading) < 0.f) hNew = -hNew;
+                existing.heading = (existing.heading + alpha * (hNew - existing.heading)).normalized();
+            }
+        }
+
         existing.nObservations++;
-        if(!existing.bFrozen) {
-            // 移动平均: 观测越多新观测权重越低
-            float w = 1.0f / existing.nObservations;
-            existing.center += w * (box.center - existing.center);
-            existing.width  += w * (box.width  - existing.width);
-            existing.depth  += w * (box.depth  - existing.depth);
-            existing.height += w * (box.height - existing.height);
-            // 观测达到3次后冻结
-            if(existing.nObservations >= 3)
+
+        // 冻结：观测足够 且 中心已稳定（标准差相对于目标尺寸足够小）
+        if(!existing.bFrozen && existing.nObservations >= MIN_FREEZE_OBS) {
+            const float stdNow = std::sqrt(std::max(existing.centerVar, 0.f));
+            const float ref = std::max(std::min(existing.width, existing.depth), 1e-4f);
+            if(stdNow < FREEZE_STD_FACTOR * ref)
                 existing.bFrozen = true;
         }
         return false;
@@ -666,6 +766,8 @@ bool Map::AddOrUpdateDetection3D(const Detection3D& box, bool bAllowNew)
     Detection3D newBox = box;
     newBox.nObservations = 1;
     newBox.bFrozen = false;
+    newBox.wSum = std::max(newBox.confidence, MIN_OBS_W);
+    newBox.centerVar = 0.f;
     mvPersistentBoxes.push_back(newBox);
     return true;
 }

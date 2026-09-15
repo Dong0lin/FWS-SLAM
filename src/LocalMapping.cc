@@ -23,6 +23,7 @@
 #include "Optimizer.h"
 #include "Converter.h"
 #include "GeometricTools.h"
+#include "Frame.h"
 
 #include<mutex>
 #include<chrono>
@@ -31,7 +32,7 @@ namespace ORB_SLAM3
 {
 
 LocalMapping::LocalMapping(System* pSys, Atlas *pAtlas, const float bMonocular, bool bInertial, const string &_strSeqName):
-    mpSystem(pSys), mpTracker(static_cast<Tracking*>(NULL)), mbMonocular(bMonocular), mbInertial(bInertial), mbResetRequested(false), mbResetRequestedActiveMap(false), mbFinishRequested(false), mbFinished(true), mpAtlas(pAtlas), bInitializing(false),
+    mpSystem(pSys), mbMonocular(bMonocular), mbInertial(bInertial), mbResetRequested(false), mbResetRequestedActiveMap(false), mbFinishRequested(false), mbFinished(true), mpAtlas(pAtlas), bInitializing(false),
     mbAbortBA(false), mbStopped(false), mbStopRequested(false), mbNotStop(false), mbAcceptKeyFrames(true),
     mIdxInit(0), mScale(1.0), mInitSect(0), mbNotBA1(true), mbNotBA2(true), mIdxIteration(0), infoInertial(Eigen::MatrixXd::Zero(9,9))
 {
@@ -269,17 +270,6 @@ void LocalMapping::Run()
 
         ResetIfRequested();
 
-        // 执行Tracking登记的尺度回拉（安全点：本地建图空闲、无并发写图；
-        // LoopClosing/GBA改写地图前都会先暂停本线程，因此此处执行不会与其并发）
-        {
-            float lambdaPull;
-            if(mpTracker && mpTracker->ConsumeScalePullback(lambdaPull))
-            {
-                cout << "[LocalMapping] 执行尺度回拉 λ=" << lambdaPull << endl;
-                mpTracker->ApplyScalePullback(lambdaPull);
-            }
-        }
-
         // Tracking will see that Local Mapping is busy
         SetAcceptKeyFrames(true);
 
@@ -360,12 +350,18 @@ void LocalMapping::MapPointCulling()
     list<MapPoint*>::iterator lit = mlpRecentAddedMapPoints.begin();
     const unsigned long int nCurrentKFid = mpCurrentKeyFrame->mnId;
 
-    int nThObs;
-    if(mbMonocular)
-        nThObs = 2;
-    else
-        nThObs = 3;
+    // 观测数阈值：单目 2，双目/长短焦也降到 2。
+    // 立体点创建时只有 1~2 个观测，50m 弱视差下很难快速累积观测，
+    // 阈值 3 会把大量立体点成批剔除，导致地图越跑越稀疏、跟踪易断开
+    const int nThObs = 2;
     const int cnThObs = nThObs;
+
+    // 初始化期宽限：地图刚建立（≤5 个 KF）时，初始立体点往往只有 1 个观测，
+    // 早期跟踪稍有抖动就会被成批剔除，形成“地图被清空→跟踪持续失败”的死亡螺旋。
+    // 把剔除时机从“2 个 KF 后”放宽到“3 个 KF 后”，给初始点留出被再次观测的机会。
+    Map* pCullMap = mpCurrentKeyFrame->GetMap();
+    const int nCullMapKFs = pCullMap ? pCullMap->KeyFramesInMap() : 0;
+    const int nMinKFsSinceCreation = (nCullMapKFs <= 5) ? 3 : 2;
 
     int borrar = mlpRecentAddedMapPoints.size();
 
@@ -380,7 +376,7 @@ void LocalMapping::MapPointCulling()
             pMP->SetBadFlag();
             lit = mlpRecentAddedMapPoints.erase(lit);
         }
-        else if(((int)nCurrentKFid-(int)pMP->mnFirstKFid)>=2 && pMP->Observations()<=cnThObs)
+        else if(((int)nCurrentKFid-(int)pMP->mnFirstKFid)>=nMinKFsSinceCreation && pMP->Observations()<=cnThObs)
         {
             pMP->SetBadFlag();
             lit = mlpRecentAddedMapPoints.erase(lit);
@@ -444,10 +440,7 @@ void LocalMapping::CreateNewMapPoints()
     // Search matches with epipolar restriction and triangulate
     for(size_t i=0; i<vpNeighKFs.size(); i++)
     {
-        // 可中断：收到停止请求时立即退出（CreateNewMapPoints是长任务，
-        // 不检查Stop会让回拉/环回的停止等待超时）。注意 i=0 也必须检查，
-        // 否则第一个邻居对的三角化（debug下可达数秒）会让停止等待超时。
-        if((i>0 && CheckNewKeyFrames()) || stopRequested())
+        if(i>0 && CheckNewKeyFrames())
             return;
 
         KeyFrame* pKF2 = vpNeighKFs[i];
@@ -494,17 +487,8 @@ void LocalMapping::CreateNewMapPoints()
 
         // Triangulate each match
         const int nmatches = vMatchedIndices.size();
-        // 平面引导三角化调试统计（每个新关键帧汇总一次）
-        int nPlaneCorr = 0;          // 被平面修正的点数
-        float fPlaneAlphaSum = 0;    // 修正权重和（除以nPlaneCorr得平均alpha）
-        int nScaleRatios = 0;        // 进入λ统计的样本数
-        float fMinScaleRatio = 1.0f, fMaxScaleRatio = 0.0f;
         for(int ikp=0; ikp<nmatches; ikp++)
         {
-            // 注意：不能用mbAbortBA——InsertKeyFrame每次插帧都会置true，
-            // 会导致所有新关键帧的三角化立即退出（点数为0→跟踪饿死）。
-            // 只有显式的停止请求(stopRequested)才中断。
-            if(stopRequested()) break;
             const int &idx1 = vMatchedIndices[ikp].first;
             const int &idx2 = vMatchedIndices[ikp].second;
 
@@ -611,15 +595,25 @@ void LocalMapping::CreateNewMapPoints()
             }
             else if(bStereo1 && cosParallaxStereo1<cosParallaxStereo2)
             {
-                countStereoAttempt++;
-                bPointStereo = true;
-                goodProj = mpCurrentKeyFrame->UnprojectStereo(idx1, x3D);
+                // 深度合理性门控：太近/太远的立体深度不建图（长短焦模式）
+                const float z1 = mpCurrentKeyFrame->mvDepth[idx1];
+                if(z1 >= ORB_SLAM3::Frame::mMinDepth && z1 <= ORB_SLAM3::Frame::mMaxDepth)
+                {
+                    countStereoAttempt++;
+                    bPointStereo = true;
+                    goodProj = mpCurrentKeyFrame->UnprojectStereo(idx1, x3D);
+                }
             }
             else if(bStereo2 && cosParallaxStereo2<cosParallaxStereo1)
             {
-                countStereoAttempt++;
-                bPointStereo = true;
-                goodProj = pKF2->UnprojectStereo(idx2, x3D);
+                // 深度合理性门控
+                const float z2 = pKF2->mvDepth[idx2];
+                if(z2 >= ORB_SLAM3::Frame::mMinDepth && z2 <= ORB_SLAM3::Frame::mMaxDepth)
+                {
+                    countStereoAttempt++;
+                    bPointStereo = true;
+                    goodProj = pKF2->UnprojectStereo(idx2, x3D);
+                }
             }
             else
             {
@@ -640,6 +634,35 @@ void LocalMapping::CreateNewMapPoints()
             float z2 = Rcw2.row(2).dot(x3D) + tcw2(2);
             if(z2<=0)
                 continue;
+
+            // ===== 两视图三角化深度门控（扑翼航拍 50m 场景）=====
+            // KF-KF 弱视差三角化会产出超远垃圾点（几千单位）或相机上方的点，
+            // 与立体匹配一致地用“深度范围 + 相机下方约束”在建图前剔除。
+            // 仅长短焦/双目深度门控启用时生效（单目时 mMaxDepth=1e9，不干预）。
+            if(ORB_SLAM3::Frame::mMaxDepth < 1e9f)
+            {
+                const float distT1 = (x3D - Ow1).norm();
+                const float distT2 = (x3D - Ow2).norm();
+                if(distT1 < ORB_SLAM3::Frame::mMinDepth || distT1 > ORB_SLAM3::Frame::mMaxDepth ||
+                   distT2 < ORB_SLAM3::Frame::mMinDepth || distT2 > ORB_SLAM3::Frame::mMaxDepth)
+                    continue;
+
+                // 相机上方+超视界门控：两个观测 KF 的相机坐标系 Y（向下为正）中，
+                // 主点上方且距离超过 mAboveCameraGate(~100m) 的点已超出可见地面
+                // 范围，只可能是弱视差三角化的假点（远处地面投影在主点上方是
+                // 正常的，不剔除）。阈值与 MaxDepth 解耦，见 Frame::SetMultiFocalCalib。
+                const float yKF1 = Rcw1.row(1).dot(x3D) + tcw1(1);
+                const float yKF2 = Rcw2.row(1).dot(x3D) + tcw2(1);
+                if((yKF1 < 0.f && distT1 > ORB_SLAM3::Frame::mAboveCameraGate) ||
+                   (yKF2 < 0.f && distT2 > ORB_SLAM3::Frame::mAboveCameraGate))
+                    continue;
+                // 主点下方超远门控：y>0（主点下方）但距离超过 mBelowPrincipalGate
+                // 的点物理上不可能（45°俯视下主点下方地面最远~50m），与帧级匹配
+                // 一致地剔除，避免假点把地面平面拟合拉向相机（见 Frame.cc 注释）。
+                if((yKF1 > 0.f && distT1 > ORB_SLAM3::Frame::mBelowPrincipalGate) ||
+                   (yKF2 > 0.f && distT2 > ORB_SLAM3::Frame::mBelowPrincipalGate))
+                    continue;
+            }
 
             //Check reprojection error in first keyframe
             const float &sigmaSquare1 = mpCurrentKeyFrame->mvLevelSigma2[kp1.octave];
@@ -718,23 +741,22 @@ void LocalMapping::CreateNewMapPoints()
             // 平面引导三角化：
             // α_parallax: 低视差时平面替代三角化深度
             // α_scale:   转弯旋转主导时三角化深度系统性偏小，用冻结平面参考修正
-            // 注意：一律使用冻结参考 d_ref（不用 d_dynamic），
-            // 否则 d_dynamic 每30帧跟随漂移点更新，形成"锚点跟着塌缩走"的正反馈闭环。
             bool bPlaneCorrected = false;
             {
                 Map* pMap = mpCurrentKeyFrame->GetMap();
                 if(pMap && pMap->IsPlaneEstimated())
                 {
                     Eigen::Vector3f n = pMap->GetPlaneNormal();
+                    float d_dynamic = pMap->GetPlaneDynamicOffset();
+                    if(std::abs(d_dynamic) < 1e-6f) d_dynamic = pMap->GetPlaneRefOffset();
                     float d_ref = pMap->GetPlaneRefOffset();
 
                     Eigen::Vector3f dir = (x3D - Ow1).normalized();
                     float ndir = n.dot(dir);
                     if(std::abs(ndir) > 1e-6f && ndir < 0)
                     {
-                        // t_plane 与 t_frozen 均以冻结参考 d_ref 计算（非递归）
-                        float t_plane = (d_ref - n.dot(Ow1)) / ndir;
-                        float t_frozen = t_plane;
+                        float t_plane = (d_dynamic - n.dot(Ow1)) / ndir;
+                        float t_frozen = (d_ref - n.dot(Ow1)) / ndir;
                         if(t_plane > 0 && t_frozen > 0)
                         {
                             float t_triang = (x3D - Ow1).norm();
@@ -772,18 +794,11 @@ void LocalMapping::CreateNewMapPoints()
                             float heightRatio = t_triang / t_plane;
                             if(heightRatio > 0.3f) {
                                 if(scaleRatio > 0.1f && scaleRatio < 2.0f)
-                                {
                                     pMap->PushTriangRatio(scaleRatio);
-                                    nScaleRatios++;
-                                    if(scaleRatio < fMinScaleRatio) fMinScaleRatio = scaleRatio;
-                                    if(scaleRatio > fMaxScaleRatio) fMaxScaleRatio = scaleRatio;
-                                }
                             }
                             if(alpha > 0 && heightRatio > 0.3f) {
                                 x3D = Ow1 + dir * (t_triang + alpha * (t_target - t_triang));
                                 bPlaneCorrected = true;
-                                nPlaneCorr++;
-                                fPlaneAlphaSum += alpha;
                             }
                         }
                     }
@@ -811,21 +826,6 @@ void LocalMapping::CreateNewMapPoints()
 
             mpAtlas->AddMapPoint(pMP);
             mlpRecentAddedMapPoints.push_back(pMP);
-        }
-
-        // 平面引导三角化调试汇总（每个新关键帧一行）
-        {
-            Map* pMapDbg = mpCurrentKeyFrame->GetMap();
-            if(pMapDbg && pMapDbg->IsPlaneEstimated() && (nPlaneCorr > 0 || nScaleRatios > 0))
-            {
-                cout << "[PlaneTriang] KF#" << mpCurrentKeyFrame->mnId
-                     << " 修正点数=" << nPlaneCorr
-                     << " 平均α=" << (nPlaneCorr > 0 ? fPlaneAlphaSum / nPlaneCorr : 0.0f)
-                     << " λ样本=" << nScaleRatios
-                     << " scaleRatio=[" << fMinScaleRatio << "," << fMaxScaleRatio << "]"
-                     << " d_ref=" << pMapDbg->GetPlaneRefOffset()
-                     << " λ=" << pMapDbg->GetPlaneScaleLambda() << endl;
-            }
         }
     }    
 }
@@ -945,10 +945,7 @@ void LocalMapping::RequestStop()
 {
     unique_lock<mutex> lock(mMutexStop);
     mbStopRequested = true;
-    // 必须同时关闭接收关键帧（上游行为）：否则Tracking在停止窗口内继续插入关键帧，
-    // LocalMapping一直忙，永远走不到停止分支，导致请求方无限/超时等待
-    unique_lock<mutex> lock2(mMutexAccept);
-    mbAcceptKeyFrames = false;
+    unique_lock<mutex> lock2(mMutexNewKFs);
     mbAbortBA = true;
 }
 
@@ -1634,11 +1631,6 @@ double LocalMapping::GetCurrKFTime()
     }
     else
         return 0.0;
-}
-
-KeyFrame* LocalMapping::GetCurrKF()
-{
-    return mpCurrentKeyFrame;
 }
 
 } //namespace ORB_SLAM

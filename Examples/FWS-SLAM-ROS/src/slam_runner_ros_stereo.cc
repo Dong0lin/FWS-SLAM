@@ -1,16 +1,15 @@
 /**
- * SLAM Runner ROS — 语义 SLAM 版
+ * SLAM Runner ROS — 长短焦双目语义 SLAM 版
  *
- * ROS 订阅相机图像，运行语义 SLAM，写入共享内存供 Qt 界面显示。
+ * ROS 订阅长短焦拼接相机图像（2560×720：左半=短焦、右半=长焦），
+ * 裁剪左右两半运行双目长短焦 SLAM，写入共享内存供 Qt 界面显示。
  * 支持 3D 框检测、动态一致性可视化、平面显示 等语义功能。
  *
  * 用法:
- *   rosrun FWS-SLAM-ROS slam_runner_ros <vocab> <settings>
+ *   rosrun FWS-SLAM-ROS slam_runner_ros_stereo <vocab> <settings>
  *
  * 参数:
  *   ~image_topic (string, default: "/usb_cam/image_raw")
- *   ~crop_left   (bool,   default: true)
- *       是否裁剪拼接图像的左半部分（双目相机 2560→1280）
  */
 
 #include <iostream>
@@ -178,8 +177,8 @@ static void WriteShm(ORB_SLAM3::SlamInterface& slam)
 // ─── 图像回调 ───
 class ImageGrabber {
 public:
-    ImageGrabber(ORB_SLAM3::SlamInterface* pSlam, bool doCrop)
-        : mpSlam(pSlam), mbCropLeft(doCrop) {}
+    ImageGrabber(ORB_SLAM3::SlamInterface* pSlam)
+        : mpSlam(pSlam) {}
 
     void GrabImage(const sensor_msgs::ImageConstPtr& msg) {
         if (!gRunning || !mpSlam) return;
@@ -200,22 +199,41 @@ public:
             return;
         }
 
-        cv::Mat im = cv_ptr->image;
+        cv::Mat imgFull = cv_ptr->image;
 
-        // 裁剪左半部分（双目拼接图像 2560×720 → 1280×720）
-        if (mbCropLeft && im.cols > im.rows * 1.5f) {
-            int halfW = im.cols / 2;
-            im = im(cv::Rect(0, 0, halfW, im.rows)).clone();
+        // 长短焦拼接图像 2560×720 → 左半=短焦 1280×720、右半=长焦 1280×720；
+        // 若输入本身是单眼图（宽高比<1.5）则左右各用同一张（退化保护）
+        cv::Mat imL, imR;
+        if (imgFull.cols > imgFull.rows * 1.5f) {
+            int halfW = imgFull.cols / 2;
+            imL = imgFull(cv::Rect(0, 0, halfW, imgFull.rows)).clone();
+            imR = imgFull(cv::Rect(halfW, 0, imgFull.cols - halfW, imgFull.rows)).clone();
+        } else {
+            imL = imgFull.clone();
+            imR = imgFull.clone();
+        }
+
+        // 临时补偿：MF_VSHIFT=<px> 把右半图整体上移（实机拼接固定垂直偏移，实测约 32px）。
+        // 默认关闭，正式使用请重新标定。
+        if (const char* ev = getenv("MF_VSHIFT")) {
+            int vy = atoi(ev);
+            if (vy > 0 && vy < imR.rows) {
+                cv::Mat shifted(imR.rows, imR.cols, imR.type(), cv::Scalar(0, 0, 0));
+                imR(cv::Rect(0, vy, imR.cols, imR.rows - vy))
+                   .copyTo(shifted(cv::Rect(0, 0, imR.cols, imR.rows - vy)));
+                imR = shifted;
+            }
         }
 
         // 通道适配（SlamInterface 期望 CV_8UC3）
-        if (im.channels() == 1) {
-            cv::cvtColor(im, im, cv::COLOR_GRAY2BGR);
-        } else if (im.channels() == 4) {
-            cv::cvtColor(im, im, cv::COLOR_BGRA2BGR);
-        }
+        auto toBGR = [](cv::Mat& m) {
+            if (m.channels() == 1)      cv::cvtColor(m, m, cv::COLOR_GRAY2BGR);
+            else if (m.channels() == 4) cv::cvtColor(m, m, cv::COLOR_BGRA2BGR);
+        };
+        toBGR(imL);
+        toBGR(imR);
 
-        mpSlam->TrackMonocular(im.data, im.cols, im.rows, msg->header.stamp.toSec());
+        mpSlam->TrackStereo(imL.data, imR.data, imL.cols, imL.rows, msg->header.stamp.toSec());
 
         gShmCtrl->frame_counter++;
         WriteShm(*mpSlam);
@@ -223,18 +241,17 @@ public:
 
 private:
     ORB_SLAM3::SlamInterface* mpSlam;
-    bool mbCropLeft;
 };
 
 // ═══════════════════════════════════════════════════════════════
 int main(int argc, char** argv)
 {
     if (argc < 3) {
-        cerr << "用法: rosrun FWS-SLAM-ROS slam_runner_ros <vocab> <settings>" << endl;
+        cerr << "用法: rosrun FWS-SLAM-ROS slam_runner_ros_stereo <vocab> <settings>" << endl;
         return 1;
     }
 
-    ros::init(argc, argv, "slam_runner_ros");
+    ros::init(argc, argv, "slam_runner_ros_stereo");
     ros::start();
 
     string vocabPath    = argv[1];
@@ -282,10 +299,10 @@ int main(int argc, char** argv)
     if (gShmMap == MAP_FAILED) { perror("[SlamRunnerROS] mmap map"); return 1; }
     memset(gShmMap, 0, sizeof(ShmMap));
 
-    // ── 初始化语义 SLAM ──
-    cout << "[SlamRunnerROS] 初始化语义 SLAM..." << endl;
+    // ── 初始化长短焦双目语义 SLAM ──
+    cout << "[SlamRunnerROS] 初始化长短焦双目语义 SLAM..." << endl;
     ORB_SLAM3::SlamInterface slam;
-    if (!slam.Init(vocabPath, settingsPath, ORB_SLAM3::SlamInterface::MONOCULAR)) {
+    if (!slam.Init(vocabPath, settingsPath, ORB_SLAM3::SlamInterface::STEREO)) {
         cerr << "[SlamRunnerROS] SLAM 初始化失败" << endl;
         return 1;
     }
@@ -297,15 +314,13 @@ int main(int argc, char** argv)
     ros::NodeHandle nh("~");
     string imageTopic;
     nh.param<string>("image_topic", imageTopic, "/usb_cam/image_raw");
-    bool cropLeft = true;
-    nh.param<bool>("crop_left", cropLeft, true);
 
     // ── 订阅相机话题 ──
-    ImageGrabber igb(&slam, cropLeft);
+    ImageGrabber igb(&slam);
     ros::Subscriber sub = nh.subscribe(imageTopic, 1, &ImageGrabber::GrabImage, &igb);
 
     cout << "[SlamRunnerROS] 已订阅: " << imageTopic
-         << ", 裁剪左半图: " << (cropLeft ? "是" : "否") << endl;
+         << "（长短焦拼接图，自动裁左右半）" << endl;
 
     // ── ROS 异步旋转 ──
     ros::AsyncSpinner spinner(2);

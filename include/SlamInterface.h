@@ -31,6 +31,12 @@ public:
     Eigen::Matrix4f TrackMonocular(const unsigned char* rgbData,
                                    int width, int height, double timestamp);
 
+    // 处理一帧双目图像（左右目等尺寸 RGB 数据），返回相机位姿
+    // 长短焦模式下 left=短焦、right=长焦；失败返回单位阵
+    Eigen::Matrix4f TrackStereo(const unsigned char* leftRgb,
+                                const unsigned char* rightRgb,
+                                int width, int height, double timestamp);
+
     // 获取当前帧图像（带特征点绘制），返回 RGB 数据
     // width/height 为输出参数
     const unsigned char* GetCurrentFrame(int& width, int& height);
@@ -59,7 +65,7 @@ public:
     void SetEnable3DBoxDetection(bool enable);
 
     // 获取持久化 3D 框 (最多 maxCount 个) 和平面参数
-    // outBoxes: float[8*N], 每框: center(3)+width+depth+height+class_id+nObs
+    // outBoxes: float[11*N], 每框: center(3)+width+depth+height+class_id+nObs+heading(3)
     // outPlaneNormal: float[3] 地面平面法向量 (可为nullptr)
     // outPlaneOffset: float   平面方程偏移 d (可为nullptr)
     int GetPersistentBoxes(float* outBoxes, float* outPlaneNormal, float* outPlaneOffset, int maxCount);
@@ -73,8 +79,13 @@ public:
     // 步进模式
     void SetStepByStep(bool enabled);
 
-    // 可视化模式：false=原图+检测框, true=动态一致性语义点
-    void SetVisualizationMode(bool showDynamic);
+    // 可视化模式：0=原图(短焦)+检测框, 1=动态一致性语义点, 2=长短焦(右目长焦)
+    void SetVisualizationMode(int mode);
+
+    // 动态一致性图像保存开关（仅可视化模式为动态一致性时生效，
+    // 输出到当前工作目录的 dynamic_vis/ 子目录，默认由 YAML 的 SaveDynamicVis 决定）
+    void SetSaveDynamicVis(bool enable);
+    bool IsSaveDynamicVis() const;
 
     // 重置地图
     void ResetActiveMap();

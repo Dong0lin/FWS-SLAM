@@ -50,3 +50,47 @@ const std::vector<float> THRESHOLD_RATIOS = {
     1.2f,  // bus - 公交车
     1.0f   // motor - 摩托车
 };
+
+// ===== 类别物理尺寸先验（单位：米），索引对齐 CLASS_NAMES =====
+// class_id: 0=pedestrian, 1=people, 2=bicycle, 3=car, 4=van,
+//           5=truck, 6=tricycle, 7=awning-tricycle, 8=bus, 9=motor
+// 用于 2D 检测框 -> 3D 框提升（Lift2DBoxesTo3D）与成排对齐（AlignBoxRows），
+// 统一散落各处的魔数，避免单目/长短焦/成排逻辑尺寸不一致。
+const std::vector<float> CLASS_LENGTH_M = {
+    0.5f,   // pedestrian
+    0.5f,   // people
+    1.8f,   // bicycle
+    4.5f,   // car
+    5.5f,   // van
+    10.0f,  // truck
+    2.5f,   // tricycle
+    2.5f,   // awning-tricycle
+    12.0f,  // bus
+    1.8f    // motor
+};
+
+const std::vector<float> CLASS_WIDTH_M = {
+    0.5f,   // pedestrian
+    0.5f,   // people
+    0.6f,   // bicycle
+    1.8f,   // car
+    2.0f,   // van
+    2.5f,   // truck
+    1.2f,   // tricycle
+    1.2f,   // awning-tricycle
+    3.0f,   // bus
+    0.8f    // motor
+};
+
+const std::vector<float> CLASS_HEIGHT_M = {
+    1.7f,   // pedestrian
+    1.7f,   // people
+    1.0f,   // bicycle
+    1.5f,   // car
+    2.2f,   // van
+    3.0f,   // truck
+    2.0f,   // tricycle
+    2.2f,   // awning-tricycle
+    3.2f,   // bus
+    1.2f    // motor
+};

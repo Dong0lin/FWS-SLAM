@@ -13,8 +13,10 @@
 #include "logging.h"
 #include <thread>
 #include <iomanip>
+#include <cstdlib>
 #include "Detector.h"
 // #include "Tracking.h"  // 添加这个包含，解决 incomplete type 问题
+#include "Frame.h"
 #include "cuda_utils.h"
 #include "preprocess.h"
 #include "common.h"
@@ -46,46 +48,100 @@ namespace ORB_SLAM3
 {
 // Detector类的构造函数
 // 初始化目标检测器的基本状态和配置参数
-Detector::Detector()
+Detector::Detector(const std::string& enginePathOverride, bool bRightEye)
 {
+    mbRightEye = bRightEye;
+
     // 初始化新图像到达标志为false
     // 表示当前没有新的图像需要处理
     mbNewImgFlag = false;
+    mbDetectorReady = false;
 
     // 初始化完成请求标志为false
     // 表示检测器尚未收到停止运行的请求
     mbFinishRequested = false;
+
+    // 提前检查 CUDA 是否可用（无驱动/无GPU时，直接禁用检测，
+    // 避免进入 TensorRT 内部时崩溃，也保证 SLAM 主流程不被阻塞）
+    {
+        int devCount = 0;
+        cudaError_t cudaErr = cudaGetDeviceCount(&devCount);
+        if(cudaErr != cudaSuccess || devCount == 0)
+        {
+            cerr << "[Detector] CUDA unavailable (err=" << cudaErr
+                 << ", devices=" << devCount << "), semantic detection disabled" << endl;
+            mbDetectorReady = false;
+            return;
+        }
+    }
     
     // 设置TensorRT引擎文件路径
-    // 使用预训练的目标检测模型进行推理
-    // std::string engine_path = "/home/dl/FWS-SLAM/engine/yolo11s_fp16.engine";
+    // 长短焦（多焦距）模式：左右目两个检测线程统一使用 engine_path_stereo
+    // （相同的更小模型，保证左右目检测一致性）；普通双目/单目仍用默认模型。
+    std::string enginePathToUse = engine_path;
+    if(mbRightEye)
+    {
+        enginePathToUse = engine_path_stereo;
+        cout << "[Detector] 右目检测线程（长短焦）：使用模型 " << engine_path_stereo << endl;
+    }
+    else if(ORB_SLAM3::Frame::mbMultiFocal && !engine_path_stereo.empty())
+    {
+        enginePathToUse = engine_path_stereo;
+        cout << "[Detector] 左目检测线程（长短焦）：使用模型 " << engine_path_stereo << endl;
+    }
+    if(!enginePathOverride.empty())
+        enginePathToUse = enginePathOverride;
 
     // 检查模型文件类型：如果是.engine文件则直接反序列化，否则从ONNX构建
-    if (engine_path.find(".onnx") == std::string::npos)
+    try
     {
-        // 加载预编译的TensorRT引擎文件
-        init(engine_path, gLogger);
+        if (enginePathToUse.find(".onnx") == std::string::npos)
+        {
+            // 加载预编译的TensorRT引擎文件
+            init(enginePathToUse, gLogger);
+        }
+        // 从ONNX模型文件构建TensorRT引擎
+        else
+        {
+            // 构建TensorRT引擎
+            build(enginePathToUse, gLogger);
+            // 保存构建的引擎以便下次直接使用
+            saveEngine(enginePathToUse);
+        }
+
+        if(!engine){
+            cerr << "[Detector] TensorRT engine load failed (engine==nullptr)" << endl;
+            mbDetectorReady = false;
+            return;
+        }
+
+        #if NV_TENSORRT_MAJOR < 10
+            // TensorRT 9.x及以下版本：使用getBindingDimensions方法
+            auto input_dims = engine->getBindingDimensions(0);
+            input_h = input_dims.d[2];  // 获取输入高度（通常是第3个维度）
+            input_w = input_dims.d[3];  // 获取输入宽度（通常是第4个维度）
+        #else
+            // TensorRT 10.x及以上版本：使用getTensorShape方法
+            auto input_dims = engine->getTensorShape(engine->getIOTensorName(0));
+            input_h = input_dims.d[2];  // 获取输入高度
+            input_w = input_dims.d[3];  // 获取输入宽度
+        #endif
     }
-    // 从ONNX模型文件构建TensorRT引擎
-    else
+    catch(const std::exception& e)
     {
-        // 构建TensorRT引擎
-        build(engine_path, gLogger);
-        // 保存构建的引擎以便下次直接使用
-        saveEngine(engine_path);
+        cerr << "[Detector] CUDA/TensorRT init failed (" << e.what()
+             << "), semantic detection disabled" << endl;
+        mbDetectorReady = false;
+        return;
+    }
+    catch(...)
+    {
+        cerr << "[Detector] CUDA/TensorRT init failed (unknown error), semantic detection disabled" << endl;
+        mbDetectorReady = false;
+        return;
     }
 
-    #if NV_TENSORRT_MAJOR < 10
-        // TensorRT 9.x及以下版本：使用getBindingDimensions方法
-        auto input_dims = engine->getBindingDimensions(0);
-        input_h = input_dims.d[2];  // 获取输入高度（通常是第3个维度）
-        input_w = input_dims.d[3];  // 获取输入宽度（通常是第4个维度）
-    #else
-        // TensorRT 10.x及以上版本：使用getTensorShape方法
-        auto input_dims = engine->getTensorShape(engine->getIOTensorName(0));
-        input_h = input_dims.d[2];  // 获取输入高度
-        input_w = input_dims.d[3];  // 获取输入宽度
-    #endif
+    mbDetectorReady = true;
 
 }
 
@@ -103,6 +159,9 @@ Detector::Detector()
  */
 Detector::~Detector()
 {
+    if(!mbDetectorReady)
+        return;
+
     // 步骤1：释放CUDA流和相关缓冲区
     // 等待流中所有操作完成，确保没有未完成的GPU操作
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -118,9 +177,10 @@ Detector::~Detector()
     // 释放存储推理结果的CPU端缓冲区
     CUDA_CHECK(cudaFreeHost(cpu_output_buffer));
 
-    // 步骤4：销毁预处理模块
-    // 释放预处理模块分配的所有GPU内存
-    cuda_preprocess_destroy();
+    // 步骤4：销毁预处理模块（本实例私有缓冲）
+    cuda_preprocess_destroy(mPreprocHostBuf, mPreprocDevBuf);
+    mPreprocHostBuf = nullptr;
+    mPreprocDevBuf = nullptr;
 
     // 步骤5：销毁TensorRT引擎和相关对象
     // 按照创建的反顺序销毁：上下文 → 引擎 → 运行时
@@ -168,9 +228,16 @@ void Detector::init(std::string engine_path, nvinfer1::ILogger& logger)
     
     // 从内存数据反序列化CUDA引擎
     engine = runtime->deserializeCudaEngine(engineData.get(), modelSize);
+    if(!engine)
+        return;
     
     // 创建执行上下文，用于实际推理操作
     context = engine->createExecutionContext();
+    if(!context){
+        delete engine;
+        engine = nullptr;
+        return;
+    }
 
     // 步骤3：获取模型的输入输出维度信息
     // 获取输入张量维度：绑定索引0为输入
@@ -196,7 +263,8 @@ void Detector::init(std::string engine_path, nvinfer1::ILogger& logger)
 
     // 步骤5：初始化CUDA预处理模块
     // 传入最大支持的图像尺寸，分配预处理所需的内存
-    cuda_preprocess_init(MAX_IMAGE_SIZE);
+    // 每个 Detector 实例分配独立的预处理缓冲（左右目线程并发安全）
+    cuda_preprocess_init(mPreprocHostBuf, mPreprocDevBuf, MAX_IMAGE_SIZE);
 
     // 步骤6：创建CUDA流用于异步操作
     // CUDA流允许并行执行多个GPU操作，提高效率
@@ -219,6 +287,14 @@ void Detector::init(std::string engine_path, nvinfer1::ILogger& logger)
 
 void ORB_SLAM3::Detector::Run()
 {    
+    if(!mbDetectorReady)
+    {
+        cerr << "[Detector] detector disabled, detection thread exits" << endl;
+        while(!isFinished())
+            usleep(20000);
+        return;
+    }
+
     while(1)
     {
         // 使用条件变量高效等待新图像（零CPU开销，唤醒延迟仅几微秒）
@@ -272,13 +348,14 @@ void Detector::PrintDetectionStatistics()
     std::cout << "        OBJECT DETECTION STATS           " << std::endl;
     std::cout << "=========================================" << std::endl;
     std::cout << std::fixed << std::setprecision(4);
-    std::cout << "Total detected frames:   " << mnDetectCount << std::endl;
-    std::cout << "Avg objects per frame:   " << avgObjs << std::endl;
+    std::cout << "Total detections run:    " << mnDetectCount << "  (左右目各算一次)" << std::endl;
+    std::cout << "Avg objects per detect:  " << avgObjs << std::endl;
     std::cout << "Avg infer time (GPU):    " << avgInfer  << " ms   <- 只与模型有关" << std::endl;
     std::cout << "Avg postproc+transform:  " << avgPost   << " ms   <- 随目标数增长" << std::endl;
     std::cout << "Avg total detect time:   " << avgDetect << " ms" << std::endl;
     std::cout << "Max total detect time:   " << mdMaxDetectTime << " ms" << std::endl;
-    std::cout << "Avg detection FPS:       " << (avgDetect > 0.0 ? 1000.0 / avgDetect : 0.0) << " fps" << std::endl;
+    std::cout << "Per-image detect FPS:    " << (avgDetect > 0.0 ? 1000.0 / avgDetect : 0.0)
+              << " fps  (左右目合计吞吐 ≈ 其一半)" << std::endl;
     std::cout << "=========================================" << std::endl;
 }
 
@@ -326,11 +403,13 @@ void Detector::preprocess(Mat& image) {
         // 灰度图像：转换为BGR格式
         cv::Mat processed_image;
         cv::cvtColor(image, processed_image, cv::COLOR_GRAY2BGR);
-        cuda_preprocess(processed_image.ptr(), processed_image.cols, processed_image.rows, 
-            gpu_buffers[0], input_w, input_h, stream);
+        cuda_preprocess(processed_image.ptr(), processed_image.cols, processed_image.rows,
+            gpu_buffers[0], input_w, input_h,
+            mPreprocHostBuf, mPreprocDevBuf, stream);
     } else {
         // 彩色图像：直接使用
-        cuda_preprocess(image.ptr(), image.cols, image.rows, gpu_buffers[0], input_w, input_h, stream);
+        cuda_preprocess(image.ptr(), image.cols, image.rows, gpu_buffers[0], input_w, input_h,
+            mPreprocHostBuf, mPreprocDevBuf, stream);
     }
     
     // 注意：不需要 cudaStreamSynchronize！
@@ -359,10 +438,7 @@ void Detector::draw(const cv::Mat& image, const vector<Detection>& output)
         auto detection = output[i];
         auto box = detection.bbox;        // 边界框坐标（已转换为原始图像坐标）
         auto class_id = detection.class_id; // 类别ID
-        auto conf = detection.conf;        // 置信度
-        auto moving_prob = detection.moving_prob; // 物体动态概率
         auto is_dynamic = detection.is_dynamic; // 是否动态目标
-        
 
         cv::Scalar color = cv::Scalar(COLORS[class_id][2], COLORS[class_id][1], COLORS[class_id][0]);
         if (is_dynamic) {
@@ -381,9 +457,7 @@ void Detector::draw(const cv::Mat& image, const vector<Detection>& output)
             std::stringstream ss;
             ss << fixed << std::setprecision(3) << detection.moving_prob;
             std::string prob_string = ss.str();
-            
-            Size text_size = getTextSize(prob_string, FONT_HERSHEY_SIMPLEX, 0.5, 1, 0);
-            
+
             Scalar text_color = (detection.moving_prob > 0.5) ? Scalar(0, 0, 255) : color;
             
             putText(image, prob_string, Point(box.x + 5, box.y - 5), 
@@ -476,32 +550,29 @@ void Detector::postprocess(std::vector<Detection>& output)
     vector<float> confidences;    // 存储置信度分数
     vector<float> moving_probs;   // 存储动态概率
 
-    // 将CPU输出缓冲区包装为OpenCV矩阵，便于处理
-    // 矩阵尺寸：属性数 × 检测数，数据类型：CV_32F（32位浮点数）
-    const Mat det_output(detection_attribute_size, num_detections, CV_32F, cpu_output_buffer);
-
-    // 步骤3：遍历所有检测框，解析坐标和类别信息
-    for (int i = 0; i < det_output.cols; ++i) {
-        // 提取当前检测框的类别概率部分（跳过前4个坐标值）
-        // 行范围：4 到 4+num_classes-1（包含80个类别的概率）
-        const Mat classes_scores = det_output.col(i).rowRange(4, 4 + num_classes);
-        
-        Point class_id_point;  // 存储最大概率类别的索引位置
-        double score;          // 存储最大概率值
-        
-        // 找到当前检测框中概率最高的类别及其分数
-        minMaxLoc(classes_scores, nullptr, &score, nullptr, &class_id_point);
-
+    // 步骤3：遍历所有检测框，解析坐标和类别信息。
+    // 输出缓冲布局为 [1, attributes, detections]（行=属性、列=检测），
+    // 直接指针索引，避免对每个候选构造 Mat 列头 + minMaxLoc 的开销
+    // （25200 个候选的 Mat 分配/函数调用是后处理的主要成本）。
+    const float* buf = cpu_output_buffer;
+    for (int i = 0; i < num_detections; ++i) {
+        // 类别概率在属性行 4..4+num_classes-1；minMaxLoc 取首个最大值，
+        // 这里用严格 > 等价（首个类别作为初始值，保证全为负分时行为一致）
+        float score = buf[4 * num_detections + i];
+        int cid = 0;
+        for (int c = 1; c < num_classes; ++c) {
+            const float s = buf[(4 + c) * num_detections + i];
+            if (s > score) { score = s; cid = c; }
+        }
 
         // 步骤4：应用置信度阈值过滤（人对小尺寸降低阈值）
-        float threshold = (class_id_point.y == 0 || class_id_point.y == 1)
-                          ? conf_threshold_people : conf_threshold;
+        float threshold = (cid == 0 || cid == 1) ? conf_threshold_people : conf_threshold;
         if (score > threshold) {
             // 提取检测框的坐标信息（YOLO格式：中心点坐标 + 宽高）
-            const float cx = det_output.at<float>(0, i);  // 中心点x坐标
-            const float cy = det_output.at<float>(1, i);  // 中心点y坐标
-            const float ow = det_output.at<float>(2, i);  // 检测框宽度
-            const float oh = det_output.at<float>(3, i);  // 检测框高度
+            const float cx = buf[0 * num_detections + i];  // 中心点x坐标
+            const float cy = buf[1 * num_detections + i];  // 中心点y坐标
+            const float ow = buf[2 * num_detections + i];  // 检测框宽度
+            const float oh = buf[3 * num_detections + i];  // 检测框高度
             
             // 将YOLO格式坐标转换为OpenCV的Rect格式（左上角坐标 + 宽高）
             Rect box;
@@ -512,9 +583,9 @@ void Detector::postprocess(std::vector<Detection>& output)
 
             // 将有效检测框信息存储到临时容器中
             boxes.push_back(box);
-            class_ids.push_back(class_id_point.y);  // 类别ID（y坐标即为索引）
-            confidences.push_back(score);           // 置信度分数
-            moving_probs.push_back(MOTION_PROBABILITIES[class_id_point.y]);  // 动态概率
+            class_ids.push_back(cid);
+            confidences.push_back(score);
+            moving_probs.push_back(MOTION_PROBABILITIES[cid]);  // 动态概率
         }
     }
 
@@ -550,14 +621,33 @@ void Detector::postprocess(std::vector<Detection>& output)
 
 void Detector::Detect()
 {
-    cv::Mat image = mImg;
+    if(mbRightEye)
+    {
+        // 右目（长焦）检测：先检测到临时缓冲，再整体换出到 objects——
+        // Tracking 不再等待右目完成（异步消费，滞后一帧），锁保护下读取最新结果
+        std::vector<Detection> vOut;
+        DetectImage(mImg, vOut);
+        {
+            std::unique_lock<std::mutex> lock(mMutexObjects);
+            objects = std::move(vOut);
+        }
+    }
+    else
+    {
+        // 左目（短焦）检测：Tracking 通过完成标志同步消费，直接写入
+        DetectImage(mImg, objects);
+    }
 
-    // 如果帧为空（视频结束），退出循环
+    // 设置检测完成标志，通知跟踪器（参考原版代码）
+    SetDetectionFlag();
+}
+
+void Detector::DetectImage(cv::Mat& image, std::vector<Detection>& output)
+{
+    // 如果帧为空（视频结束），退出
     if (image.empty()) return;
 
-    // vector<Detection> objects;  // 检测结果容器
-
-    objects.clear();  // 清空上一次的检测结果，准备存储新的结果
+    output.clear();  // 清空上一次的检测结果，准备存储新的结果
 
     // 整帧检测计时起点（预处理 + 推理 + 后处理 + 坐标转换）
     auto detectStart = std::chrono::steady_clock::now();
@@ -574,14 +664,49 @@ void Detector::Detect()
         cudaStreamSynchronize(stream);
     auto end = std::chrono::steady_clock::now();  // 记录推理结束时间
 
-    postprocess(objects);  // 后处理，解析检测结果（NMS 随候选框数量增长）
+    postprocess(output);  // 后处理，解析检测结果（NMS 随候选框数量增长）
 
     // 预计算转换参数并转换检测框坐标
     if (!isPrecomputed) {
         PrecomputeTransformParams(image);
     }
 
-    TransformBoxes(objects);
+    // 调试：SLAM_BOX_DEBUG=1 时打印第一帧检测框变换前后的坐标，
+    // 用于核对检测框是否已正确反变换回原始图像坐标（区分检测输出问题 vs 可视化问题）
+    if (getenv("SLAM_BOX_DEBUG"))
+    {
+        static bool s_bBoxDebugPrinted = false;
+        if (!s_bBoxDebugPrinted)
+        {
+            s_bBoxDebugPrinted = true;
+            cerr << "[BoxDebug] image=" << image.cols << "x" << image.rows
+                 << " input=" << input_w << "x" << input_h
+                 << " ratio_h=" << ratio_h << " ratio_w=" << ratio_w
+                 << " offset=(" << offset_x << "," << offset_y << ")" << endl;
+            for (size_t i = 0; i < output.size() && i < 5; i++)
+                cerr << "[BoxDebug] before[" << i << "]=" << output[i].bbox.x << "," << output[i].bbox.y
+                     << " " << output[i].bbox.width << "x" << output[i].bbox.height << endl;
+        }
+    }
+
+    TransformBoxes(output);
+
+    // 每次检测都按当前图像尺寸重算 letterbox 参数：
+    // 左右目尺寸一致时结果相同（零开销差异），尺寸不同时也能正确反变换，
+    // 避免第二张图复用第一张图的缓存参数导致检测框错位。
+    isPrecomputed = false;
+
+    if (getenv("SLAM_BOX_DEBUG"))
+    {
+        static bool s_bBoxDebugPrinted2 = false;
+        if (!s_bBoxDebugPrinted2)
+        {
+            s_bBoxDebugPrinted2 = true;
+            for (size_t i = 0; i < output.size() && i < 5; i++)
+                cerr << "[BoxDebug] after[" << i << "]=" << output[i].bbox.x << "," << output[i].bbox.y
+                     << " " << output[i].bbox.width << "x" << output[i].bbox.height << endl;
+        }
+    }
 
     // ===== 累计耗时与目标数量统计（运行结束后统一输出一次）=====
     if (gEnableTimingStats)
@@ -595,7 +720,7 @@ void Detector::Detect()
         mdTotalInferTime  += inferMs;
         mdTotalPostTime   += postMs;
         mdTotalDetectTime += detectMs;
-        mnTotalObjects    += static_cast<long long>(objects.size());
+        mnTotalObjects    += static_cast<long long>(output.size());
         if (detectMs > mdMaxDetectTime)
             mdMaxDetectTime = detectMs;
     }
@@ -642,24 +767,7 @@ void Detector::Detect()
     //     }
     // } 
 
-    // 设置检测完成标志，通知跟踪器（参考原版代码）
-    SetDetectionFlag();
-
 }
-
-//判断图像是否是新来的，是新来的就改为false，返回true。线程独占锁。
-bool Detector::isNewImgArrived()
-{
-    unique_lock<mutex> lock(mMutexGetNewImg);
-    if(mbNewImgFlag)
-    {
-        mbNewImgFlag=false;
-        return true;
-    }
-    else
-    	return false;
-}
-
 
 //设置目标检测标志量。通过条件变量通知 Tracking 线程。
 void Detector::SetDetectionFlag()
@@ -667,7 +775,10 @@ void Detector::SetDetectionFlag()
     {
         // 使用条件变量的同一把锁保护共享标志，确保内存可见性
         std::unique_lock<std::mutex> lock(mMutexCvDetDone);
-        mpTracker->mbNewDetImgFlag = true;
+        if(mbRightEye)
+            mpTracker->mbNewDetImgFlagRight = true;   // 右目线程：通知右目完成标志
+        else
+            mpTracker->mbNewDetImgFlag = true;
     }
     // 通知 Tracking 线程检测已完成（零延迟唤醒）
     mCvDetDone.notify_one();

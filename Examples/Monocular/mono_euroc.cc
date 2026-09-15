@@ -40,6 +40,11 @@ int main(int argc, char **argv)
     if (ORB_SLAM3::gEnableTimingStats)
         cout << "[Timing] 耗时统计已开启 (SLAM_TIMING)" << endl;
 
+    // 无头模式：设置环境变量 SLAM_VIEWER=0 可关闭可视化（不影响正常使用）
+    ORB_SLAM3::System::eViewerType viewerType = ORB_SLAM3::System::VIEWER_PANGOLIN;
+    if (const char* envViewer = std::getenv("SLAM_VIEWER"))
+        viewerType = (ORB_SLAM3::System::eViewerType)atoi(envViewer);
+
     if(argc < 5)
     {
         cerr << endl << "Usage: ./mono_euroc path_to_vocabulary path_to_settings path_to_sequence_folder_1 path_to_times_file_1 (path_to_image_folder_2 path_to_times_file_2 ... path_to_image_folder_N path_to_times_file_N) (trajectory_file_name)" << endl;
@@ -88,7 +93,12 @@ int main(int argc, char **argv)
     int fps = 20;
     float dT = 1.f/fps;
     // Create SLAM system. It initializes all system threads and gets ready to process frames.
-    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::MONOCULAR, ORB_SLAM3::System::VIEWER_PANGOLIN);
+    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::MONOCULAR, viewerType);
+
+    // 质量日志：默认关闭；加 --save-quality 参数开启（每30帧采样）
+    for(int i = 0; i < argc; i++)
+        if(std::string(argv[i]) == "--save-quality")
+            SLAM.GetTracker()->SetSaveQuality(true);
     float imageScale = SLAM.GetImageScale();
 
     double t_resize = 0.f;

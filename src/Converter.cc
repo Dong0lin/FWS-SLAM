@@ -203,17 +203,6 @@ Eigen::Matrix<double,3,3> Converter::toMatrix3d(const cv::Mat &cvMat3)
     return M;
 }
 
-Eigen::Matrix<double,4,4> Converter::toMatrix4d(const cv::Mat &cvMat4)
-{
-    Eigen::Matrix<double,4,4> M;
-
-    M << cvMat4.at<float>(0,0), cvMat4.at<float>(0,1), cvMat4.at<float>(0,2), cvMat4.at<float>(0,3),
-         cvMat4.at<float>(1,0), cvMat4.at<float>(1,1), cvMat4.at<float>(1,2), cvMat4.at<float>(1,3),
-         cvMat4.at<float>(2,0), cvMat4.at<float>(2,1), cvMat4.at<float>(2,2), cvMat4.at<float>(2,3),
-         cvMat4.at<float>(3,0), cvMat4.at<float>(3,1), cvMat4.at<float>(3,2), cvMat4.at<float>(3,3);
-    return M;
-}
-
 Eigen::Matrix<float,3,3> Converter::toMatrix3f(const cv::Mat &cvMat3)
 {
     Eigen::Matrix<float,3,3> M;
@@ -222,17 +211,6 @@ Eigen::Matrix<float,3,3> Converter::toMatrix3f(const cv::Mat &cvMat3)
             cvMat3.at<float>(1,0), cvMat3.at<float>(1,1), cvMat3.at<float>(1,2),
             cvMat3.at<float>(2,0), cvMat3.at<float>(2,1), cvMat3.at<float>(2,2);
 
-    return M;
-}
-
-Eigen::Matrix<float,4,4> Converter::toMatrix4f(const cv::Mat &cvMat4)
-{
-    Eigen::Matrix<float,4,4> M;
-
-    M << cvMat4.at<float>(0,0), cvMat4.at<float>(0,1), cvMat4.at<float>(0,2), cvMat4.at<float>(0,3),
-            cvMat4.at<float>(1,0), cvMat4.at<float>(1,1), cvMat4.at<float>(1,2), cvMat4.at<float>(1,3),
-            cvMat4.at<float>(2,0), cvMat4.at<float>(2,1), cvMat4.at<float>(2,2), cvMat4.at<float>(2,3),
-            cvMat4.at<float>(3,0), cvMat4.at<float>(3,1), cvMat4.at<float>(3,2), cvMat4.at<float>(3,3);
     return M;
 }
 
@@ -248,53 +226,6 @@ std::vector<float> Converter::toQuaternion(const cv::Mat &M)
     v[3] = q.w();
 
     return v;
-}
-
-cv::Mat Converter::tocvSkewMatrix(const cv::Mat &v)
-{
-    return (cv::Mat_<float>(3,3) <<             0, -v.at<float>(2), v.at<float>(1),
-            v.at<float>(2),               0,-v.at<float>(0),
-            -v.at<float>(1),  v.at<float>(0),              0);
-}
-
-bool Converter::isRotationMatrix(const cv::Mat &R)
-{
-    cv::Mat Rt;
-    cv::transpose(R, Rt);
-    cv::Mat shouldBeIdentity = Rt * R;
-    cv::Mat I = cv::Mat::eye(3,3, shouldBeIdentity.type());
-
-    return  cv::norm(I, shouldBeIdentity) < 1e-6;
-
-}
-
-std::vector<float> Converter::toEuler(const cv::Mat &R)
-{
-    assert(isRotationMatrix(R));
-    float sy = sqrt(R.at<float>(0,0) * R.at<float>(0,0) +  R.at<float>(1,0) * R.at<float>(1,0) );
-
-    bool singular = sy < 1e-6; // If
-
-    float x, y, z;
-    if (!singular)
-    {
-        x = atan2(R.at<float>(2,1) , R.at<float>(2,2));
-        y = atan2(-R.at<float>(2,0), sy);
-        z = atan2(R.at<float>(1,0), R.at<float>(0,0));
-    }
-    else
-    {
-        x = atan2(-R.at<float>(1,2), R.at<float>(1,1));
-        y = atan2(-R.at<float>(2,0), sy);
-        z = 0;
-    }
-
-    std::vector<float> v_euler(3);
-    v_euler[0] = x;
-    v_euler[1] = y;
-    v_euler[2] = z;
-
-    return v_euler;
 }
 
 Sophus::SE3<float> Converter::toSophus(const cv::Mat &T) {

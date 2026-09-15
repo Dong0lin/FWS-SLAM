@@ -196,7 +196,6 @@ public:
 
     Eigen::Matrix<float,6,1> GetDeltaBias();
 
-    Bias GetOriginalBias();
     Bias GetUpdatedBias();
 
     void printMeasurements() const {

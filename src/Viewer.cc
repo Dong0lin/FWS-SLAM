@@ -164,7 +164,7 @@ void Viewer::Run()
     mbFinished = false;
     mbStopped = false;
 
-    pangolin::CreateWindowAndBind("ORB-SLAM3: Map Viewer",1024,768);
+    pangolin::CreateWindowAndBind("FWS-SLAM: Map Viewer",1024,768);
 
     // 3D Mouse handler requires depth testing to be enabled
     glEnable(GL_DEPTH_TEST);
@@ -189,7 +189,7 @@ void Viewer::Run()
     pangolin::Var<bool> menuStep("menu.Step",false,false);
 
     pangolin::Var<bool> menuShowOptLba("menu.Show LBA opt", false, true);
-    pangolin::Var<bool> menuShowDetection3D("menu.Show 3D Boxes", false, true);
+    pangolin::Var<bool> menuShowDetection3D("menu.Show 3D Boxes", true, true);
     // Define Camera Render Object (for view / scene browsing)
     pangolin::OpenGlRenderState s_cam(
                 pangolin::ProjectionMatrix(1024,768,mViewpointF,mViewpointF,512,389,0.1,1000),
@@ -206,7 +206,7 @@ void Viewer::Run()
     Eigen::Matrix4f Twc_eigen = Eigen::Matrix4f::Identity();
     pangolin::OpenGlMatrix Ow; // Oriented with g in the z axis
     Ow.SetIdentity();
-    cv::namedWindow("ORB-SLAM3: Current Frame");
+    cv::namedWindow("FWS-SLAM: Current Frame");
 
     bool bFollow = true;
     bool bLocalizationMode = false;
@@ -340,25 +340,31 @@ void Viewer::Run()
 
         pangolin::FinishFrame();
 
-        cv::Mat toShow;
         cv::Mat im = mpFrameDrawer->DrawFrame(trackedImageScale);
 
-        if(both){
+        if(both)
+        {
             cv::Mat imRight = mpFrameDrawer->DrawRightFrame(trackedImageScale);
-            cv::hconcat(im,imRight,toShow);
-        }
-        else{
-            toShow = im;
+
+            // 长短焦/双目：左右目分两个独立窗口显示，
+            // 避免拼接图在缩放时造成"检测框/特征点错位"的视觉误判
+            if(mImageViewerScale != 1.f)
+            {
+                int wR = imRight.cols * mImageViewerScale;
+                int hR = imRight.rows * mImageViewerScale;
+                cv::resize(imRight, imRight, cv::Size(wR, hR));
+            }
+            cv::imshow("FWS-SLAM: Right Frame", imRight);
         }
 
         if(mImageViewerScale != 1.f)
         {
-            int width = toShow.cols * mImageViewerScale;
-            int height = toShow.rows * mImageViewerScale;
-            cv::resize(toShow, toShow, cv::Size(width, height));
+            int width = im.cols * mImageViewerScale;
+            int height = im.rows * mImageViewerScale;
+            cv::resize(im, im, cv::Size(width, height));
         }
 
-        cv::imshow("ORB-SLAM3: Current Frame",toShow);
+        cv::imshow("FWS-SLAM: Current Frame", im);
         cv::waitKey(mT);
 
         if(menuReset)

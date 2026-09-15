@@ -46,27 +46,6 @@
 
 namespace ORB_SLAM3
 {
-// KF 级平面约束强度：随 λ 自适应（λ 由 PlaneRemark 每30帧从三角化高度比更新）
-//  λ>0.95  健康   → 0.2  弱约束，允许真实高度变化
-//  0.85<λ≤0.95    → 0.5
-//  λ≤0.85  退化   → 2.0  强约束，压住旋转主导时的平移尺度收缩（原固定0.05过弱）
-static inline double PlaneKFInfo(const Map* pMap)
-{
-    const float lambda = pMap->GetPlaneScaleLambda();
-    if(lambda > 0.95f) return 0.2;
-    if(lambda > 0.85f) return 0.5;
-    return 2.0;
-}
-
-// 平面点级约束的 Huber 核：delta = 10%×H_cam（标记阈值5%的2倍）。
-// 真平面点残差小→线性加权；被误标记的楼/树/动态残留残差大→降权。
-static inline void AddPlaneHuber(EdgePlaneConstraint* eP, const Map* pMap)
-{
-    g2o::RobustKernelHuber* rkP = new g2o::RobustKernelHuber;
-    eP->setRobustKernel(rkP);
-    rkP->setDelta(0.1 * pMap->GetPlaneRefHeight() + 0.01);
-}
-
 bool sortByVal(const pair<MapPoint*, int> &a, const pair<MapPoint*, int> &b)
 {
     return (a.second < b.second);
@@ -199,7 +178,7 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
             eKF->setPlane(pMap->GetPlaneNormal().cast<double>(),
                           (double)pMap->GetPlaneRefOffset(),
                           (double)pMap->GetPlaneRefHeight());
-            eKF->setInformation(Eigen::Matrix<double,1,1>::Identity() * PlaneKFInfo(pMap));
+            eKF->setInformation(Eigen::Matrix<double,1,1>::Identity() * 0.05);
             optimizer.addEdge(eKF);
         }
         
@@ -229,7 +208,6 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
             eP->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(id)));
             eP->setPlane(pMap->GetPlaneNormal().cast<double>(), (double)pMap->GetPlaneRefOffset() + (double)pMP->mfSemanticHeightOffset, INFO * pMP->mfPlaneInfo);
             optimizer.addEdge(eP);
-            AddPlaneHuber(eP, pMap);
         }
        const map<KeyFrame*,tuple<int,int>> observations = pMP->GetObservations();
 
@@ -697,7 +675,6 @@ void Optimizer::FullInertialBA(Map *pMap, int its, const bool bFixLocal, const l
             eP->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(id)));
             eP->setPlane(pMap->GetPlaneNormal().cast<double>(), (double)pMap->GetPlaneRefOffset() + (double)pMP->mfSemanticHeightOffset, INFO * pMP->mfPlaneInfo);
             optimizer.addEdge(eP);
-            AddPlaneHuber(eP, pMap);
         }
 
         const map<KeyFrame*,tuple<int,int>> observations = pMP->GetObservations();
@@ -1375,7 +1352,7 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
             eKF->setPlane(pMap->GetPlaneNormal().cast<double>(),
                           (double)pMap->GetPlaneRefOffset(),
                           (double)pMap->GetPlaneRefHeight());
-            eKF->setInformation(Eigen::Matrix<double,1,1>::Identity() * PlaneKFInfo(pMap));
+            eKF->setInformation(Eigen::Matrix<double,1,1>::Identity() * 0.05);
             optimizer.addEdge(eKF);
         }
         if(pKFi->mnId>maxKFid)
@@ -1454,7 +1431,6 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
             eP->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(id)));
             eP->setPlane(pMap->GetPlaneNormal().cast<double>(), (double)pMap->GetPlaneRefOffset() + (double)pMP->mfSemanticHeightOffset, INFO * pMP->mfPlaneInfo);
             optimizer.addEdge(eP);
-            AddPlaneHuber(eP, pMap);
         }
         nPoints++;
 
@@ -2901,7 +2877,6 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
             eP->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(id)));
             eP->setPlane(pMap->GetPlaneNormal().cast<double>(), (double)pMap->GetPlaneRefOffset() + (double)pMP->mfSemanticHeightOffset, INFO * pMP->mfPlaneInfo);
             optimizer.addEdge(eP);
-            AddPlaneHuber(eP, pMap);
         }
         const map<KeyFrame*,tuple<int,int>> observations = pMP->GetObservations();
 
@@ -3834,7 +3809,6 @@ void Optimizer::LocalBundleAdjustment(KeyFrame* pMainKF,vector<KeyFrame*> vpAdju
             eP->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(id)));
             eP->setPlane(pCurrentMap->GetPlaneNormal().cast<double>(), (double)pCurrentMap->GetPlaneRefOffset() + (double)pMPi->mfSemanticHeightOffset, INFO * pMPi->mfPlaneInfo);
             optimizer.addEdge(eP);
-            AddPlaneHuber(eP, pCurrentMap);
         }
 
 
@@ -4499,7 +4473,6 @@ void Optimizer::MergeInertialBA(KeyFrame* pCurrKF, KeyFrame* pMergeKF, bool *pbS
             eP->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(id)));
             eP->setPlane(pMap->GetPlaneNormal().cast<double>(), (double)pMap->GetPlaneRefOffset() + (double)pMP->mfSemanticHeightOffset, INFO * pMP->mfPlaneInfo);
             optimizer.addEdge(eP);
-            AddPlaneHuber(eP, pMap);
         }
 
         const map<KeyFrame*,tuple<int,int>> observations = pMP->GetObservations();

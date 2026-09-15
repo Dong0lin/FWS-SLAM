@@ -340,12 +340,6 @@ Eigen::Vector3f Preintegrated::GetOriginalDeltaPosition()
     return dP;
 }
 
-Bias Preintegrated::GetOriginalBias()
-{
-    std::unique_lock<std::mutex> lock(mMutex);
-    return b;
-}
-
 Bias Preintegrated::GetUpdatedBias()
 {
     std::unique_lock<std::mutex> lock(mMutex);

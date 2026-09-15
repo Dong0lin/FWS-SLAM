@@ -1,0 +1,40 @@
+FWS-SLAM
+Copyright (C) 2025-2026 Dong Lin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+----------------------------------------------------------------------
+本项目基于以下开源项目修改而来，相关版权归原作者所有：
+
+1. ORB-SLAM3
+   Copyright (C) 2017-2021 Carlos Campos, Richard Elvira,
+   Juan J. Gómez Rodríguez, José M.M. Montiel and Juan D. Tardós,
+   University of Zaragoza.
+   License: GPLv3
+   https://github.com/UZ-SLAMLab/ORB_SLAM3
+
+2. Semantic SLAM for mobile robots in dynamic environments
+   (提供语义 SLAM 与 TensorRT 检测的基础实现)
+   Copyright (C) 2023 Qi Zhang, Changdi Li
+   License: MIT
+   https://doi.org/10.1088/1361-6501/acd1a4
+
+3. 第三方库位于 Thirdparty/，各自遵循其原始许可证：
+   - DBoW2 / DUtils：GPLv3 (部分 BSD)
+   - g2o：BSD
+   - Sophus：MIT
+
+----------------------------------------------------------------------
+本程序按 GPLv3 分发；由于包含 GPLv3 的 ORB-SLAM3 代码，
+整体必须以 GPLv3 发布，完整许可证文本见 LICENSE。

@@ -30,7 +30,7 @@ struct ShmCtrl {
     volatile int32_t cmd_reset;         // 1=重置地图
     volatile int32_t cmd_shutdown;      // 1=关闭 SLAM 进程
     volatile int32_t cmd_step;          // 1=步进一帧 (步进模式下)
-    volatile int32_t cmd_vis_mode;      // 0=原图, 1=动态一致性可视化
+    volatile int32_t cmd_vis_mode;      // -1=原图(短焦), 1=动态一致性, 2=长短焦(右目长焦)
 
     // 绘制选项 (由 Qt 设置，SLAM 读取后用于 MapDrawer)
     volatile int32_t draw_points;
@@ -100,7 +100,8 @@ struct ShmMap {
 
     // ── 3D 检测框 + 平面法向量 ──
     volatile int32_t box_count;              // 有效3D框数
-    float            boxes[MAX_3D_BOXES][8];  // [0-2]=center, [3]=width, [4]=depth, [5]=height, [6]=class_id, [7]=nObs
+    float            boxes[MAX_3D_BOXES][11]; // [0-2]=center, [3]=width, [4]=depth, [5]=height,
+                                              // [6]=class_id, [7]=nObs, [8-10]=heading(车长轴,平面内)
     float            plane_normal[3];         // 地面平面法向量
     float            plane_offset;            // 地面平面偏移 d (n·P = d)
 

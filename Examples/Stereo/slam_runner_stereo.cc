@@ -1,13 +1,14 @@
 /**
- * SLAM Runner — 独立进程，读取图像运行 SLAM，结果写入共享内存供 Qt 界面显示
+ * SLAM Runner（双目/长短焦） — 独立进程，读取双目图像运行 SLAM，
+ * 结果写入共享内存供 Qt 界面显示（配套 Qt 的"语义SLAM-双目/语义SLAM-长短焦"模型）
  *
  * 用法:
- *   ./slam_runner <vocab> <settings> <image_folder> <timestamp_file> [trajectory_name]
+ *   ./slam_runner_stereo <vocab> <settings> <mav0_root> <timestamp_file> [trajectory_name]
+ *   （单路径：mav0 根目录，自动找 cam0=左目/短焦、cam1=右目/长焦；
+ *     也兼容 <left_dir>,<right_dir> 逗号分隔）
  *
  * 时间戳文件格式 (与 ORB-SLAM3 mono_euroc 兼容):
- *   每行: <timestamp_ns> <image_name>
- *   例如: 1403636579763555584 frame_0001
- *   (自动追加 .png 后缀)
+ *   每行一个时间戳（FWS 秒 ~86 或 EuRoC 纳秒 ~1e17），同时是图片文件名（不含扩展名）
  */
 
 #include <iostream>
@@ -51,13 +52,35 @@ static void SignalHandler(int) {
     if (gSemFrame) sem_post(gSemFrame);
 }
 
-// ─── 读取时间戳文件（与 mono_euroc_mine 一致）───
-// 格式: 每行是时间戳(纳秒)，同时也是图片文件名（不含扩展名）
-// 例如: 行 "1403636579763555584" → 图片 1403636579763555584.jpg
-static bool LoadTimestamps(const string& imagePath,
-                           const string& timesPath,
-                           vector<string>& vImages,
-                           vector<double>& vTimestamps)
+// ─── 图像目录解析：兼容三种布局 ───
+//   1) <base>/<side>/data          (mav0 根，side=cam0 左目 / cam1 右目)
+//   2) <base>/mav0/<side>/data     (mav0 上一级)
+//   3) <base>                      (扁平目录，直接放 xxx.jpg)
+static string ResolveCamDir(const string& base, const string& side)
+{
+    struct stat st;
+    const string p1 = base + "/" + side + "/data";
+    if (stat(p1.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+        return p1;
+    const string p2 = base + "/mav0/" + side + "/data";
+    if (stat(p2.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+        return p2;
+    return base;
+}
+
+static bool HasCamDir(const string& base, const string& side)
+{
+    struct stat st;
+    return (stat((base + "/" + side + "/data").c_str(), &st) == 0 && S_ISDIR(st.st_mode)) ||
+           (stat((base + "/mav0/" + side + "/data").c_str(), &st) == 0 && S_ISDIR(st.st_mode));
+}
+
+// ─── 双目/长短焦：时间戳文件每行一个时间戳（FWS 秒或 EuRoC 纳秒），
+//     同时为左右目构造路径：<leftDir>/xxx.jpg、<rightDir>/xxx.jpg ───
+static bool LoadStereoImages(const string& leftDir, const string& rightDir,
+                             const string& timesPath,
+                             vector<string>& vLeft, vector<string>& vRight,
+                             vector<double>& vTimestamps)
 {
     ifstream f(timesPath);
     if (!f.is_open()) {
@@ -65,33 +88,42 @@ static bool LoadTimestamps(const string& imagePath,
         return false;
     }
 
-    vImages.reserve(5000);
-    vTimestamps.reserve(5000);
-
     string line;
     while (getline(f, line)) {
         if (line.empty() || line[0] == '#') continue;
 
         stringstream ss;
         ss << line;
-        vImages.push_back(imagePath + "/cam0/data/" + ss.str() + ".jpg");
+        string tok1, tok2;
+        ss >> tok1;
+        ss >> tok2;
+        if (tok1.empty()) continue;
+
+        // 两种时间戳格式：
+        //   EuRoC: "<ns时间戳> <图像名>"        → 图像名取 tok2，时间戳取 tok1(纳秒)
+        //   FWS:   "<秒时间戳>"（即图像名，如 86.002631）→ 图像名=时间戳=tok1(秒)
+        string imgName;
         double t;
-        ss >> t;
-        // 兼容两种时间戳：EuRoC 纳秒（~1e17）与 FWS 秒（~85，Qt 数据集 time.txt 即秒）
+        if (!tok2.empty()) {
+            imgName = tok2;
+            t = atof(tok1.c_str());
+        } else {
+            imgName = tok1;
+            t = atof(tok1.c_str());
+        }
+        vLeft.push_back(leftDir + "/" + imgName + ".jpg");
+        vRight.push_back(rightDir + "/" + imgName + ".jpg");
         vTimestamps.push_back(t > 1e6 ? t * 1e-9 : t);
     }
     f.close();
 
-    cout << "[SlamRunner] 加载 " << vImages.size() << " 张图像" << endl;
-    if (vImages.empty()) return false;
+    cout << "[SlamRunner] 加载 " << vLeft.size() << " 组双目图像 (左: "
+         << leftDir << ", 右: " << rightDir << ")" << endl;
+    if (vLeft.empty()) return false;
 
-    // 检查第一张图片是否存在
-    ifstream testImg(vImages[0]);
-    if (!testImg.good()) {
-        cerr << "[SlamRunner] 警告: 第一张图片不存在: " << vImages[0] << endl;
-        cerr << "[SlamRunner] 请确认图片扩展名和路径是否正确" << endl;
-    }
-    testImg.close();
+    ifstream testL(vLeft[0]), testR(vRight[0]);
+    if (!testL.good() || !testR.good())
+        cerr << "[SlamRunner] 警告: 首组图像不存在: " << vLeft[0] << " / " << vRight[0] << endl;
 
     return true;
 }
@@ -125,9 +157,9 @@ static void ProcessCommands(ORB_SLAM3::SlamInterface& slam)
 
     // 可视化模式切换
     if (ctrl.cmd_vis_mode != 0) {
-        // -1=原图, 1=动态一致性 (绝对值=1表示有命令，符号表示模式)
-        // Qt 写入: 1=动态, -1=原图
-        slam.SetVisualizationMode(ctrl.cmd_vis_mode > 0);
+        // Qt 写入: -1=原图(短焦), 1=动态一致性, 2=长短焦(右目长焦)
+        int mode = (ctrl.cmd_vis_mode == 2) ? 2 : (ctrl.cmd_vis_mode > 0 ? 1 : 0);
+        slam.SetVisualizationMode(mode);
         ctrl.cmd_vis_mode = 0;  // 确认已处理
     }
 
@@ -233,7 +265,8 @@ int main(int argc, char** argv)
 {
     if (argc < 5) {
         cerr << "用法: " << argv[0]
-             << " <vocab> <settings> <image_folder> <timestamp_file> [trajectory_name]" << endl;
+             << " <vocab> <settings> <mav0_root> <timestamp_file> [trajectory_name]" << endl;
+        cerr << "  mav0_root：自动找 cam0=左目/短焦、cam1=右目/长焦；也兼容 <left>,<right> 逗号分隔" << endl;
         return 1;
     }
 
@@ -241,6 +274,25 @@ int main(int argc, char** argv)
     string settingsPath = argv[2];
     string imagePath    = argv[3];
     string timesPath    = argv[4];
+
+    // 解析左右目目录：单一路径（mav0 根，自动找 cam0/cam1）或逗号分隔（显式左右目录）
+    string leftDir, rightDir;
+    {
+        size_t comma = imagePath.find(',');
+        if (comma != string::npos) {
+            leftDir  = ResolveCamDir(imagePath.substr(0, comma), "cam0");
+            rightDir = ResolveCamDir(imagePath.substr(comma + 1), "cam1");
+        } else if (HasCamDir(imagePath, "cam0")) {
+            leftDir  = ResolveCamDir(imagePath, "cam0");
+            rightDir = ResolveCamDir(imagePath, "cam1");
+            cout << "[SlamRunner] 检测到双目/长短焦目录: cam0(左)=" << leftDir
+                 << " cam1(右)=" << rightDir << endl;
+        } else {
+            cerr << "[SlamRunner] 错误: 未在 " << imagePath
+                 << " 下找到 cam0/data（需要 mav0 根目录，或 <left>,<right>）" << endl;
+            return 1;
+        }
+    }
 
     // 轨迹保存到 slam_runner 所在目录，同时切换工作目录使 image_quality.txt 等也落在此处
     string trajDir;
@@ -253,9 +305,9 @@ int main(int argc, char** argv)
     cout << "[SlamRunner] 工作目录 & 轨迹输出: " << trajDir << endl;
 
     // ── 加载图像列表 ──
-    vector<string> vImages;
+    vector<string> vImagesL, vImagesR;
     vector<double> vTimestamps;
-    if (!LoadTimestamps(imagePath, timesPath, vImages, vTimestamps))
+    if (!LoadStereoImages(leftDir, rightDir, timesPath, vImagesL, vImagesR, vTimestamps))
         return 1;
 
     // ── 信号处理 ──
@@ -321,7 +373,7 @@ int main(int argc, char** argv)
     // ── 初始化 SLAM ──
     cout << "[SlamRunner] 初始化 SLAM..." << endl;
     ORB_SLAM3::SlamInterface slam;
-    if (!slam.Init(vocabPath, settingsPath, ORB_SLAM3::SlamInterface::MONOCULAR)) {
+    if (!slam.Init(vocabPath, settingsPath, ORB_SLAM3::SlamInterface::STEREO)) {
         cerr << "[SlamRunner] SLAM 初始化失败" << endl;
         return 1;
     }
@@ -331,7 +383,7 @@ int main(int argc, char** argv)
 
     // ── 主循环 ──
     vector<float> vTimesTrack;
-    size_t totalImages = vImages.size();
+    size_t totalImages = vImagesL.size();
 
     for (size_t i = 0; i < totalImages && gRunning; i++) {
         // 检查关闭命令
@@ -365,23 +417,26 @@ int main(int argc, char** argv)
             if (!gRunning || gShmCtrl->cmd_shutdown) break;
         }
 
-        // 读取图像
-        cv::Mat im = cv::imread(vImages[i], cv::IMREAD_UNCHANGED);
-        if (im.empty()) {
-            cerr << "[SlamRunner] 读取图像失败: " << vImages[i] << endl;
+        // 读取左右目图像
+        cv::Mat imL = cv::imread(vImagesL[i], cv::IMREAD_UNCHANGED);
+        cv::Mat imR = cv::imread(vImagesR[i], cv::IMREAD_UNCHANGED);
+        if (imL.empty() || imR.empty()) {
+            cerr << "[SlamRunner] 读取图像失败: " << vImagesL[i]
+                 << " / " << vImagesR[i] << endl;
             continue;
         }
 
         // 缩放
         if (imageScale != 1.f) {
-            int w = im.cols * imageScale;
-            int h = im.rows * imageScale;
-            cv::resize(im, im, cv::Size(w, h));
+            int w = imL.cols * imageScale;
+            int h = imL.rows * imageScale;
+            cv::resize(imL, imL, cv::Size(w, h));
+            cv::resize(imR, imR, cv::Size(w, h));
         }
 
         // 跟踪
         auto t1 = chrono::steady_clock::now();
-        slam.TrackMonocular(im.data, im.cols, im.rows, vTimestamps[i]);
+        slam.TrackStereo(imL.data, imR.data, imL.cols, imL.rows, vTimestamps[i]);
         auto t2 = chrono::steady_clock::now();
 
         double ttrack = chrono::duration<double>(t2 - t1).count();

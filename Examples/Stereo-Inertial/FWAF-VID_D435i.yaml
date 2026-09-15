@@ -1,0 +1,70 @@
+%YAML:1.0
+
+#--------------------------------------------------------------------------------------------
+# FWAF-VID dataset (Outdoor_02) - RealSense D435i stereo + built-in IMU
+# Calibration source: FWAF-VID-master/calibr/D435i+Build_in_IMU/imu_stereo-camchain-imucam.yaml
+#--------------------------------------------------------------------------------------------
+File.version: "1.0"
+
+Camera.type: "Rectified"
+
+# Rectified camera intrinsics (cam0 = infra1)
+Camera1.fx: 385.9663579533714
+Camera1.fy: 386.66632586105874
+Camera1.cx: 326.31560591362586
+Camera1.cy: 228.94820856640544
+
+# Baseline between cam0/cam1 (metres)
+Stereo.b: 0.050666
+
+Camera.width: 640
+Camera.height: 480
+
+Camera.fps: 30
+
+Camera.RGB: 1
+
+# Close/Far threshold. Baseline times.
+Stereo.ThDepth: 40.0
+
+# Transformation from left camera to body-frame (imu)  = inv(T_cam0_imu)
+IMU.T_b_c1: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: f
+   data: [0.9999978428666335,  0.00205910585980988, -0.000272663048795662, -0.00689029595861703,
+         -0.00206263316747091, 0.99990486175381351, -0.01363865776033400,  -0.00614633292614450,
+          0.00024455366799715, 0.01363919074377822,  0.99990695200571457,   0.02826742478005257,
+          0.0, 0.0, 0.0, 1.0]
+
+IMU.InsertKFsWhenLost: 0
+
+# IMU noise (from D435i+Build_in_IMU/imu.yaml)
+IMU.NoiseGyro: 2.1056473846954868e-03
+IMU.NoiseAcc:  1.2116163608259510e-02
+IMU.GyroWalk:  1.6015774431543977e-05
+IMU.AccWalk:   2.3267111948367786e-04
+IMU.Frequency: 200.0
+
+#--------------------------------------------------------------------------------------------
+# ORB Parameters
+#--------------------------------------------------------------------------------------------
+ORBextractor.nFeatures: 1250
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 20
+ORBextractor.minThFAST: 7
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters
+#--------------------------------------------------------------------------------------------
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -3.5
+Viewer.ViewpointF: 500.0
